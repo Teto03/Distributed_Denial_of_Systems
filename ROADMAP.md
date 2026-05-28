@@ -99,10 +99,11 @@ Files in `src/main/java/it/unitn/ds/`:
   (traccia §1 "Coordinator election": *"the replica that knows the most
   recent update"*) sia per la fase di Synchronization.
 
-### 1.2 Messaggi di protocollo
+### 1.2 Messaggi di protocollo  ✅ COMPLETATO
 
-Tutti `Serializable` e immutabili, in `src/main/java/it/unitn/ds/` (o
-sotto-package `messages/` se preferito).
+Tutti `Serializable` e immutabili, in `src/main/java/it/unitn/ds/messages/`.
+Il broadcast del coordinatore è nominato `UpdateMsg` per non collidere col
+data class `Update` (history entry).
 
 - Client→Replica: `ReadRequest`, `WriteRequest` (già nel codebase).
 - Replica→Coordinatore: `ForwardWrite(idx, val, clientRef, contactedReplicaId)`.
