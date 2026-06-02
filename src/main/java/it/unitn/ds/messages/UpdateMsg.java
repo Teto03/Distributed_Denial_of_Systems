@@ -12,20 +12,23 @@ import it.unitn.ds.Update;
  *
  * <p>Wraps the immutable {@link Update} (id + index + value) and additionally
  * carries the originating {@link #client} reference together with
- * {@link #contactedReplicaId}, so the replica that was originally contacted
- * can return the final {@code WriteResult} to the client with the right
- * {@code fromReplica} field.</p>
+ * {@link #contactedReplicaId} and the client {@link #reqId}, so the replica
+ * that was originally contacted can return the final {@code WriteResult} to
+ * the client with the right {@code fromReplica} field once the update is
+ * committed.</p>
  */
 public final class UpdateMsg implements Serializable {
 
     public final Update update;
     public final ActorRef client;
     public final int contactedReplicaId;
+    public final long reqId;
 
-    public UpdateMsg(Update update, ActorRef client, int contactedReplicaId) {
+    public UpdateMsg(Update update, ActorRef client, int contactedReplicaId, long reqId) {
         this.update = Objects.requireNonNull(update, "update must not be null");
         this.client = Objects.requireNonNull(client, "client must not be null");
         this.contactedReplicaId = contactedReplicaId;
+        this.reqId = reqId;
     }
 
     @Override

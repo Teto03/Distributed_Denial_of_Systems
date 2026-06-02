@@ -81,7 +81,7 @@ Devono valere in ogni sprint — non aggiungerli mai "alla fine".
 
 ---
 
-## Sprint 1 — Modello dati + happy path
+## Sprint 1 — Modello dati + happy path  ✅ COMPLETATO
 
 Obiettivo: sistema funzionante quando NESSUNO crasha. Niente heartbeat,
 niente elezione.
@@ -120,27 +120,44 @@ data class `Update` (history entry).
 - Timeout interni (a sé stesso): `UpdateTimeout`, `ForwardTimeout`,
   `HeartbeatTimeout`, `ElectionAckTimeout`, `GlobalElectionTimeout`.
 
-### 1.3 Client e Replica — happy path
+### 1.3 Client e Replica — happy path  ✅ COMPLETATO
 
-- `Replica.initSystem(InitSystem)` salva `group`, `coordinatorId`, inizializza
-  `positions[POSITIONS_LIST_LENGTH]`.
-- `Replica` su read: risponde subito con `ReadResult(true, idx, P[idx],
-  contactedReplicaId=self.id)`.
-- `Replica` non-coordinatore su write: forward al coordinatore, parte
-  `ForwardTimeout`.
-- `Coordinatore` su forward: assegna `<epoch, seq+1>`, broadcast `Update`,
-  attende quorum di `UpdateAck`, broadcast `WriteOk`. Su `WriteOk` ricevuto
-  da sé stesso applica e fa fire della callback.
-- `Replica` su `Update`: ack al coordinatore, parte `UpdateTimeout`.
+Quattro nuovi messaggi in `messages/` per il dialogo client ↔ replica
+(`ClientRead`, `ClientWrite`, `ReadReply`, `WriteReply`): le
+`AbstractClient.ReadRequest`/`WriteRequest` del codebase sono solo i messaggi
+che il test harness invia al client, servivano quindi messaggi propri.
+`reqId` (id di richiesta locale al client) aggiunto anche a `ForwardWrite` e
+`UpdateMsg` per accoppiare risposta/timeout alla richiesta.
+
+- `Replica.initSystem(InitSystem)` salva `group` e `coordinatorId`;
+  `positions[POSITIONS_LIST_LENGTH]` parte a 0.
+- `Replica` su read (`ClientRead`): risponde subito con
+  `ReadReply(value=P[idx], fromReplica=self.id)`.
+- `Replica` non-coordinatore su write (`ClientWrite`): forward `ForwardWrite`
+  al coordinatore.
+- `Coordinatore` su `ClientWrite`/`ForwardWrite`: assegna `<epoch, seq+1>`,
+  broadcast `UpdateMsg` a tutte le repliche (sé incluso), conta gli
+  `UpdateAck` e al quorum `⌊N/2⌋+1` broadcast `WriteOk`.
+- `Replica` su `UpdateMsg`: `UpdateAck` al coordinatore + memorizza il
+  proposal fino al `WriteOk`.
 - `Replica` su `WriteOk`: applica `P[idx]=val`, append a `UpdateHistory`,
-  chiama `callbackOnUpdateApplied`. La replica originariamente contattata
-  risponde al client con `WriteResult(true, idx, val, contactedReplicaId)`.
-- `Client`: gestisce `ReadTimeout`/`WriteTimeout` con i delay forniti.
+  logga `applied update <e>:<i> (idx, val)`, chiama `callbackOnUpdateApplied`.
+  La sola replica contattata risponde al client con `WriteReply`
+  (→ `WriteResult.fromReplica` = replica contattata, regola 11).
+- `Client`: `sendRead`/`sendWrite` con timeout self-schedulati; le reply
+  fanno fire `callbackOn{Read,Write}Result`; il tick fa fire
+  `callbackOn{Read,Write}Timeout` solo se la reply non è ancora arrivata
+  (matching per `reqId`).
 
-**Exit criteria**:
-- `./gradlew test --tests "*APICompliance*oneClientWriteWaitRead*"` verde.
-- `./gradlew test --tests "*APICompliance*callbackOnUpdateApplied*"` verde.
-- `./gradlew test --tests "*NoCrashes*"` verde nei casi senza crash.
+> **Nota di scoping.** `ForwardTimeout`/`UpdateTimeout` lato replica NON sono
+> ancora schedulati: hanno senso solo con i crash (rilevamento del
+> coordinatore), quindi vengono attivati in Sprint 2. Il timeout lato client
+> copre già il caso "nessuna risposta" osservabile in Sprint 1.
+
+**Exit criteria** (tutti verdi, stabili su 3 run):
+- `./gradlew test --tests "*APICompliance*oneClientWriteWaitRead*"` ✅ (4/4).
+- `./gradlew test --tests "*APICompliance*callbackOnUpdateApplied*"` ✅ (6/6).
+- `./gradlew test --tests "*NoCrashes*"` ✅ (4/4).
 
 ---
 

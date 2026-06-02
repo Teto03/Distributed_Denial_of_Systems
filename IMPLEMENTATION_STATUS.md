@@ -17,8 +17,9 @@ Per la roadmap completa con criteri di uscita per sprint vedere
 2. [Sprint 0 — Setup](#sprint-0--setup-completato)
 3. [Sprint 1.1 — Modello dati](#sprint-11--modello-dati-completato)
 4. [Sprint 1.2 — Messaggi di protocollo](#sprint-12--messaggi-di-protocollo-completato)
-5. [Cosa non è ancora implementato](#cosa-non-è-ancora-implementato)
-6. [Come compilare ed eseguire i test](#come-compilare-ed-eseguire-i-test)
+5. [Sprint 1.3 — Client e Replica (happy path)](#sprint-13--client-e-replica-happy-path-completato)
+6. [Cosa non è ancora implementato](#cosa-non-è-ancora-implementato)
+7. [Come compilare ed eseguire i test](#come-compilare-ed-eseguire-i-test)
 
 ---
 
@@ -41,8 +42,8 @@ SD_PROJECT/
     ├── main/java/it/unitn/ds/
     │   ├── AbstractClient.java          # codebase obbligatoria (Genetti/Pasquali)
     │   ├── AbstractReplica.java         # codebase obbligatoria
-    │   ├── Client.java                  # scheletro — handler in Sprint 1.3
-    │   ├── Replica.java                 # scheletro — handler in Sprint 1.3
+    │   ├── Client.java                  # Sprint 1.3 — read/write + timeout
+    │   ├── Replica.java                 # Sprint 1.3 — happy path two-phase
     │   ├── Logger.java                  # logging timestamped (codebase)
     │   ├── Main.java                    # entry point demo
     │   ├── NetworkChannel.java          # canale FIFO con latenza random
@@ -50,6 +51,10 @@ SD_PROJECT/
     │   ├── Update.java                  # Sprint 1.1
     │   ├── UpdateHistory.java           # Sprint 1.1
     │   └── messages/                    # Sprint 1.2
+    │       ├── ClientRead.java        # Sprint 1.3 (client -> replica)
+    │       ├── ClientWrite.java       # Sprint 1.3 (client -> replica)
+    │       ├── ReadReply.java         # Sprint 1.3 (replica -> client)
+    │       ├── WriteReply.java        # Sprint 1.3 (replica -> client)
     │       ├── ForwardWrite.java
     │       ├── UpdateMsg.java
     │       ├── UpdateAck.java
@@ -213,32 +218,86 @@ Tutti `Serializable` per coerenza, anche se schedulati via
 
 ---
 
+## Sprint 1.3 — Client e Replica (happy path) (COMPLETATO)
+
+Implementazione del percorso "tutto funziona": nessun crash, nessuna
+elezione. Corrisponde alla traccia §1 ("Client requests" + "Update
+protocol").
+
+### Quattro nuovi messaggi client ↔ replica
+
+Le `AbstractClient.ReadRequest`/`WriteRequest` del codebase sono i messaggi
+che il *test harness* manda al client; servivano quindi messaggi propri per
+il dialogo client → replica → client. Sono in `messages/`, tutti immutabili
+e `Serializable`:
+
+| Classe        | Direzione        | Campi                                          |
+|---------------|------------------|------------------------------------------------|
+| `ClientRead`  | client → replica | `long reqId`, `int index`                      |
+| `ClientWrite` | client → replica | `long reqId`, `int index`, `int value`         |
+| `ReadReply`   | replica → client | `long reqId`, `int index`, `int value`, `int fromReplica` |
+| `WriteReply`  | replica → client | `long reqId`, `int index`, `int value`, `int fromReplica` |
+
+Il `reqId` è un identificatore locale del client: serve per accoppiare la
+risposta (o il timeout) alla richiesta che l'ha generata quando ci sono più
+richieste in volo. Per questo è stato aggiunto anche a `ForwardWrite` e
+`UpdateMsg`, così viaggia con la write fino al `WriteOk` e la replica
+contattata sa a chi e con quale id rispondere.
+
+### Replica
+
+- `initSystem` salva `group` e `coordinatorId`.
+- `getSystemNumberOfActors` ritorna `group.size()`.
+- **Read**: servita localmente, risponde con `ReadReply(... value=P[idx],
+  fromReplica=self)`.
+- **Write su replica contattata**: se è il coordinatore avvia subito il
+  broadcast, altrimenti inoltra `ForwardWrite` al coordinatore.
+- **Coordinatore**: assegna `<epoch, seq+1>`, broadcasta `UpdateMsg` a tutte
+  le repliche (sé stesso incluso), conta gli `UpdateAck` e al raggiungimento
+  del quorum `⌊N/2⌋+1` broadcasta `WriteOk`.
+- **WriteOk** (ogni replica): applica `P[idx]=val`, appende a
+  `UpdateHistory`, logga `applied update <e>:<i> (idx, val)` e chiama
+  `callbackOnUpdateApplied`. La sola replica contattata risponde al client
+  con `WriteReply` (così `WriteResult.fromReplica` = replica contattata,
+  regola 11).
+
+### Client
+
+- `sendRead`/`sendWrite`: generano un `reqId`, inviano `ClientRead`/
+  `ClientWrite` e armano un timeout self-schedulato.
+- Su `ReadReply`/`WriteReply` chiamano `callbackOnReadResult`/
+  `callbackOnWriteResult`.
+- Il timeout (`ReadTick`/`WriteTick`, messaggi interni inviati solo a sé)
+  fa scattare `callbackOnReadTimeout`/`callbackOnWriteTimeout` **solo** se la
+  risposta non è ancora arrivata: l'arrivo della reply rimuove il `reqId`
+  dall'insieme dei pending, così un tick tardivo viene semplicemente
+  ignorato (niente `Cancellable` da gestire).
+
+`crash(...)` resta volutamente vuota: la modalità `CRASHED` e i contatori
+per tipo sono Sprint 2.
+
+---
+
 ## Cosa non è ancora implementato
 
-I file `Client.java`, `Replica.java`, `Main.java` sono **scheletri**:
-
-- `Replica.initSystem`, `Replica.crash`, `Replica.getSystemNumberOfActors`
-  vuoti; `createReceive()` ritorna solo il base receive builder.
-- `Client.sendRead`, `Client.sendWrite` vuoti.
-- `Main` istanzia repliche ma non invia nessun client request.
-
-Tutti i comportamenti — handler delle write/read, broadcast del
-coordinatore, raccolta del quorum, applicazione dell'update, callback
-`callbackOnUpdateApplied`, gestione di `WriteTimeout`/`ReadTimeout` lato
-client — sono in **Sprint 1.3**.
+`Main.java` è ancora uno scaffold (gli scenari di demo sono Sprint 5).
 
 Heartbeat periodico, stato `CRASHED` via `become`, e i contatori di crash
 per tipo (`Crash.Type.{Now, Heartbeat, Update, WriteOK, Election}`) sono in
 **Sprint 2**.
 
-Elezione, sincronizzazione, completamento degli update orfani sono in
+Elezione ring, sincronizzazione, completamento degli update orfani sono in
 **Sprint 3**.
 
-Stato dei test:
+Stato dei test (`./gradlew test`):
 
-- `./gradlew compileJava` ✅ verde.
-- `./gradlew compileTestJava` ✅ verde.
-- `./gradlew test` ❌ atteso fallire finché 1.3 non è in piedi.
+- `NoCrashes` ✅ verde (4/4 casi).
+- `APICompliance` → happy path verde: `oneClientWriteWaitRead` (4/4),
+  `callbackOnUpdateAppliedInvokedOnAllReplicas` (4/4),
+  `callbackOnUpdateAppliedOncePerWrite` (2/2). I casi su crash
+  (`replicasCrashNow`, `crashReplicaAndTryRequests`) ed elezione restano
+  rossi: attesi in Sprint 2/3.
+- `WithCrashes` ❌ atteso rosso (richiede crash + elezione, Sprint 2-3).
 
 ---
 

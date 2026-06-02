@@ -12,7 +12,8 @@ import akka.actor.ActorRef;
  * <p>{@link #contactedReplicaId} preserves the id of the replica the client
  * originally addressed, so that the eventual {@code WriteResult} returned to
  * the client carries the right {@code fromReplica} (rule 11 of the mandatory
- * codebase).</p>
+ * codebase). {@link #reqId} carries the client request identifier so the
+ * contacted replica can later answer the right pending request.</p>
  */
 public final class ForwardWrite implements Serializable {
 
@@ -20,12 +21,14 @@ public final class ForwardWrite implements Serializable {
     public final int value;
     public final ActorRef client;
     public final int contactedReplicaId;
+    public final long reqId;
 
-    public ForwardWrite(int index, int value, ActorRef client, int contactedReplicaId) {
+    public ForwardWrite(int index, int value, ActorRef client, int contactedReplicaId, long reqId) {
         this.index = index;
         this.value = value;
         this.client = client;
         this.contactedReplicaId = contactedReplicaId;
+        this.reqId = reqId;
     }
 
     @Override
