@@ -161,12 +161,57 @@ che il test harness invia al client, servivano quindi messaggi propri.
 
 ---
 
-## Sprint 2 — Heartbeat + crash semplici
+## Organizzazione del lavoro a due (Sprint 2–3)
+
+Sprint 2 e Sprint 3 sono **sequenziali sul percorso critico** (il trigger
+dell'elezione e la Synchronization dipendono dal crash detection e dalla FSM
+dello Sprint 2). Per lavorare in parallelo NON ci si divide "uno sprint a
+testa" — B resterebbe bloccato ad aspettare A. Ci si divide invece **per
+modulo lungo l'interfaccia**, con tag di ownership su ogni task:
+
+- **[A] — Detection & FSM**: possiede lo Sprint 2 completo (percorso critico).
+- **[B] — Election & Sync (statico)**: possiede tutte le parti dello Sprint 3
+  che sono *codice puro* e non richiedono runtime (POJO messaggi, logica ring,
+  comparatore vincitore) + i relativi unit test isolati. Non dipende da A una
+  volta fissato il contratto in Fase 0.
+- **[A+B] — Integrazione**: il pezzo intrinsecamente sequenziale (aggancio
+  timeout→elezione, Synchronization, anti-livelock) si fa in pair programming
+  quando A ha finito lo Sprint 2.
+
+### Fase 0 — Contratto delle interfacce  ⚠️ FARE PER PRIMA, INSIEME
+
+> 📄 **Dettaglio completo in [`CONTRACT_PHASE0.md`](CONTRACT_PHASE0.md)** —
+> catalogo messaggi congelato, contratto FSM/timeout, stub delle classi di B e
+> le decisioni D1–D5 da chiudere. Quanto segue è il riassunto.
+
+Mezza giornata a tavolino per fissare i confini fra i due flussi, così A e B
+lavorano su file diversi senza conflitti di merge. Da congelare:
+
+- Firma definitiva dei messaggi: `Heartbeat`, `Election`, `ElectionAck`,
+  `Synchronization` (campi, tipi, immutabilità). Già abbozzati in §1.2.
+- Nomi ed enum degli stati FSM: `NORMAL` / `ELECTION` / `CRASHED`.
+- Enum `Crash.Type` **completo** — inclusi i valori che userà solo lo
+  Sprint 3 (`Election`), così B non tocca l'enum dopo.
+- Nomi dei timeout e loro payload (`HeartbeatTimeout`, `ElectionAckTimeout`,
+  `GlobalElectionTimeout`).
+- Firma dei metodi di confine che A espone e B consuma (es. `startElection()`,
+  accesso a `latestId()` / `UpdateHistory`, calcolo del successore nel ring).
+
+**Exit criteria Fase 0**: interfacce/POJO compilano (`./gradlew build` verde)
+con corpi-stub, così i due branch partono da una base condivisa.
+
+---
+
+## Sprint 2 — Heartbeat + crash semplici   👤 Owner: **A**
 
 Obiettivo: il sistema sopravvive a crash isolati di repliche non-coordinatrici
 e rileva la morte del coordinatore (senza ancora rieleggere).
 
 Riferimento traccia §1 "Crash detection".
+
+> **Divisione**: tutto lo Sprint 2 è di **[A]**. È il fondamento del detection
+> e sta sul percorso critico: va coperto da una persona dedicata mentre B
+> avanza in parallelo sulle parti statiche dello Sprint 3.
 
 - `Heartbeat` periodico dal coordinatore ogni `getCoordinatorBeatInterval()`
   (default 1000 ms, regola 9 della codebase).
@@ -202,34 +247,58 @@ nuovi.
 Riferimento traccia §1 "Coordinator election" + "Properties" (uniform
 agreement).
 
-- **Receive separato per ELECTION**: durante l'elezione la replica passa a
-  un behavior dedicato che gestisce solo `Election`, `ElectionAck`,
+> **Divisione del lavoro** (tag su ogni task):
+> - **[B]** = codice puro, parallelizzabile fin da subito (nessun runtime,
+>   testabile in isolamento). ~60% dello Sprint 3.
+> - **[A+B]** = integrazione con la FSM/detection dello Sprint 2, da fare in
+>   pair programming quando A ha finito. È la parte delicata sulle invarianti
+>   (TO-1 / uniform agreement).
+
+**Parti statiche — [B] (in parallelo con lo Sprint 2 di A):**
+
+- **[B] Ring topology**: ordine crescente di `id`, il successore di `i` è
+  `(i+1) mod N` skip-ando le repliche note come crashed. Funzione pura →
+  unit test dedicato.
+- **[B] Messaggio Election**: porta `Map<ReplicaId, UpdateID>` con il
+  `latestId` noto a ciascuna replica (oppure lista di entries — scelta da
+  motivare in report). Acked hop-by-hop con `ElectionAck` (traccia §1). POJO
+  immutabile.
+- **[B] Decisione del vincitore**: replica con `latestId` massimo; tie-break
+  per `id` più alto (regola di codice). Comparatore isolato → unit test su
+  casi limite (parità, history vuota).
+- **[B] Diff della Synchronization**: dato il `latestId` di una replica,
+  calcolare la lista di `Update` mancanti dalla history del vincitore.
+  Logica pura su `UpdateHistory`, testabile senza attori.
+
+**Integrazione — [A+B] (dopo lo Sprint 2, in pair):**
+
+- **[A+B] Receive separato per ELECTION**: durante l'elezione la replica passa
+  a un behavior dedicato che gestisce solo `Election`, `ElectionAck`,
   `Synchronization`, `Crash`, `ElectionAckTimeout`,
   `GlobalElectionTimeout`. Tutte le `Update`/`WriteOk` ricevute in questo
-  stato vengono accodate o droppate secondo specifica.
-- **Ring topology**: ordine crescente di `id`, il successore di `i` è
-  `(i+1) mod N` skip-ando le repliche note come crashed.
-- **Messaggio Election**: porta `Map<ReplicaId, UpdateID>` con il `latestId`
-  noto a ciascuna replica (oppure lista di entries — scelta da motivare in
-  report). Acked hop-by-hop con `ElectionAck` (traccia §1).
-- **`ElectionAckTimeout`**: se il successore non ACKa, skip e forward al
+  stato vengono accodate o droppate secondo specifica. (Richiede la FSM
+  `become` dello Sprint 2 → [A].)
+- **[A+B] Trigger dell'elezione**: collegare l'`HeartbeatTimeout` dello
+  Sprint 2 (finora logging-only) all'avvio effettivo dell'elezione.
+- **[A+B] `ElectionAckTimeout`**: se il successore non ACKa, skip e forward al
   successivo (traccia §1: *"a replica that forwards an ELECTION message
   starts a timeout while waiting for the corresponding ACK"*).
-- **Decisione del vincitore**: replica con `latestId` massimo; tie-break per
-  `id` più alto (regola di codice).
-- **`Synchronization`**: il vincitore broadcasta annuncio + lista degli
-  `Update` mancanti per ciascuna replica (o lista compatta che le altre
-  diffano contro la propria history).
-- **Completamento update pendenti** prima di bumpare l'epoch: la traccia §1
-  "Properties" lo richiede esplicitamente. Solo dopo aver "chiuso" gli
+- **[A+B] `Synchronization` broadcast**: il vincitore broadcasta annuncio +
+  lista degli `Update` mancanti per ciascuna replica (usa il diff di [B]).
+- **[A+B] Completamento update pendenti** prima di bumpare l'epoch: la traccia
+  §1 "Properties" lo richiede esplicitamente. Solo dopo aver "chiuso" gli
   update orfani il vincitore incrementa l'epoch via `nextEpoch()` e
   riprende le write.
-- **`GlobalElectionTimeout`**: rete di sicurezza contro livelock — se
+- **[A+B] `GlobalElectionTimeout`**: rete di sicurezza contro livelock — se
   l'elezione non termina entro N×ElectionAckTimeout, riparte.
-- **Firing callback**: `callbackOnElectionStarted(crashedCoordId)` alla
+- **[A+B] Firing callback**: `callbackOnElectionStarted(crashedCoordId)` alla
   prima `Election` inviata; `callbackOnCoordinatorElected(newCoordId)` sul
   vincitore alla decisione e su ogni altra replica al processamento di
   `Synchronization` (regola 6 codebase + commenti nei test).
+
+**Punto di merge**: quando A chiude gli exit criteria dello Sprint 2, i due
+integrano le parti statiche [B] dentro la FSM [A]. Da fare insieme perché è
+qui che i due mondi si incontrano e dove vivono le invarianti di safety.
 
 **Exit criteria**:
 - `APICompliance.callbackOnElectionStartedInvokedCorrectly` verde per
