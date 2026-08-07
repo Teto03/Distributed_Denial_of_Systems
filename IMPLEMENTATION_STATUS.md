@@ -20,6 +20,7 @@ Per la roadmap completa con criteri di uscita per sprint vedere
 5. [Sprint 1.3 — Client e Replica (happy path)](#sprint-13--client-e-replica-happy-path-completato)
 6. [Cosa non è ancora implementato](#cosa-non-è-ancora-implementato)
 7. [Come compilare ed eseguire i test](#come-compilare-ed-eseguire-i-test)
+8. [Sprint 3 [B] — Parti statiche di elezione e sincronizzazione](#sprint-3-b--parti-statiche-di-elezione-e-sincronizzazione-completato)
 
 ---
 
@@ -50,6 +51,10 @@ SD_PROJECT/
     │   ├── UpdateID.java                # Sprint 1.1
     │   ├── Update.java                  # Sprint 1.1
     │   ├── UpdateHistory.java           # Sprint 1.1
+    │   ├── election/                    # Sprint 3 [B] — logica pura di elezione
+    │   │   ├── RingTopology.java        # ordine del ring + successore vivo
+    │   │   ├── ElectionLogic.java       # payload Election + scelta del vincitore
+    │   │   └── SyncPlan.java            # diff degli update da replayare
     │   └── messages/                    # Sprint 1.2
     │       ├── ClientRead.java        # Sprint 1.3 (client -> replica)
     │       ├── ClientWrite.java       # Sprint 1.3 (client -> replica)
@@ -70,10 +75,14 @@ SD_PROJECT/
     │       └── GlobalElectionTimeout.java
     └── test/java/it/unitn/ds/
         ├── TestsCommons.java
-        └── base/
-            ├── NoCrashes.java           # test happy path
-            ├── WithCrashes.java         # test con crash istrumentati
-            └── APICompliance.java       # test contrattuali codebase
+        ├── base/
+        │   ├── NoCrashes.java           # test happy path
+        │   ├── WithCrashes.java         # test con crash istrumentati
+        │   └── APICompliance.java       # test contrattuali codebase
+        └── election/                    # Sprint 3 [B] — unit test puri
+            ├── RingTopologyTest.java
+            ├── ElectionLogicTest.java
+            └── SyncPlanTest.java
 ```
 
 ## Sprint 0 — Setup (COMPLETATO)
@@ -287,7 +296,9 @@ per tipo (`Crash.Type.{Now, Heartbeat, Update, WriteOK, Election}`) sono in
 **Sprint 2**.
 
 Elezione ring, sincronizzazione, completamento degli update orfani sono in
-**Sprint 3**.
+**Sprint 3**: la logica pura (`election/`) è già pronta — vedi
+[Sprint 3 [B]](#sprint-3-b--parti-statiche-di-elezione-e-sincronizzazione-completato)
+— mentre il cablaggio dentro `Replica` è la parte di integrazione `[A+B]`.
 
 Stato dei test (`./gradlew test`):
 
@@ -336,3 +347,210 @@ Per la demo interattiva:
 
 (Il `Main.java` corrente è uno scaffold senza client: produrrà solo il
 banner di start/end finché Sprint 5 non aggiungerà gli scenari di demo.)
+
+---
+
+## Sprint 3 [B] — Parti statiche di elezione e sincronizzazione (COMPLETATO)
+
+> **Branch**: `sprint3-election` (partito dal commit di `main` con la Fase 0
+> verde, come previsto da `CONTRACT_PHASE0.md` §9).
+>
+> **Perimetro**: solo i task taggati **[B]** in `ROADMAP.md` → Sprint 3, cioè
+> la logica *pura* che non richiede runtime né FSM. Niente è stato toccato
+> fuori dal package `election/` e dai suoi test: **`Replica.java` non è stato
+> modificato**, così il lavoro su Sprint 2 procede in parallelo senza
+> conflitti di merge (ownership di `CONTRACT_PHASE0.md` §1 rispettata).
+
+### Perché tutto in un package separato
+
+Le quattro voci [B] della roadmap hanno una caratteristica in comune: sono
+**funzioni pure** dei dati del protocollo (insieme dei membri, payload della
+`Election`, `UpdateHistory`). Isolarle in `it.unitn.ds.election` come classi
+`final` con solo metodi `static` e costruttore privato dà tre vantaggi:
+
+1. sono testabili **senza `ActorSystem`**, quindi i test girano in
+   millisecondi e sono deterministici (nessuna latenza random di mezzo);
+2. l'integrazione `[A+B]` diventa un lavoro di *cablaggio*: dentro `Replica`
+   servirà solo decidere *quando* chiamarle, non *cosa* calcolano;
+3. le invarianti di safety (chi vince, cosa va replayato) restano in un punto
+   solo e sono verificabili a colpo d'occhio in fase di discussione.
+
+Nessuna classe del package tiene stato: non c'è nulla di mutabile condiviso
+fra attori, come richiesto dalla traccia §2.
+
+### `RingTopology` — topologia del ring
+
+Traccia §1 "Coordinator election": *"The logical ring is defined by ordering
+replicas according to their identifiers"*.
+
+```java
+static List<Integer>     order(Collection<Integer> memberIds);
+static Optional<Integer> successor(int self, Collection<Integer> memberIds, Set<Integer> suspected);
+```
+
+- **`order`** costruisce il ring canonico passando da un `TreeSet`: ordina in
+  senso crescente **e** deduplica in un colpo solo, così che chiamarla con
+  `group.keySet()` o con una lista arbitraria di id produca esattamente lo
+  stesso risultato. Ritorna una lista `unmodifiable` costruita su una copia,
+  quindi modificare la collezione sorgente dopo la chiamata non altera il ring
+  già calcolato.
+- **`successor`** è il cuore della tolleranza ai guasti durante l'elezione
+  (traccia §1: *"the sender assumes that the next replica in the ring has
+  crashed, skips it, and forwards the message to the following replica"*).
+  L'implementazione non usa aritmetica modulare su indici — sarebbe fragile
+  con id non contigui — ma costruisce la **sequenza di hop**: prima tutti gli
+  id maggiori di `self` in ordine crescente, poi (wrap-around) tutti quelli
+  minori. Il primo che non è in `suspected` è il successore.
+
+  Conseguenze volute di questa formulazione:
+  - `self` è escluso per costruzione → **una replica non è mai successore di
+    sé stessa**, e se tutti gli altri sono sospettati si ottiene
+    `Optional.empty()` invece di un loop su sé stessi;
+  - `self` **non deve necessariamente appartenere** a `memberIds`: la
+    partenza è il suo punto di inserimento. Utile se la vista locale ha già
+    rimosso qualcuno;
+  - salta **N sospettati consecutivi**, non uno solo (serve al corner case 3
+    dello Sprint 4: due nodi consecutivi che crashano durante l'elezione);
+  - lo skip funziona anche **attraverso il wrap-around**.
+
+  `suspected` è un semplice `Set<Integer>` passato dal chiamante: il ring
+  resta senza stato e chi possiede il set (la `Replica`, decisione D5) può
+  farlo crescere come preferisce.
+
+### `ElectionLogic` — payload e scelta del vincitore
+
+```java
+static final UpdateID NONE = new UpdateID(0, 0);
+static int                    winner(Map<Integer, UpdateID> latestPerReplica);
+static UpdateID               latestOf(UpdateHistory history);
+static Map<Integer, UpdateID> withEntry(Map<Integer, UpdateID> latestPerReplica, int replicaId, UpdateID latest);
+static int                    newEpoch(Map<Integer, UpdateID> latestPerReplica);
+```
+
+- **`winner`** implementa alla lettera la regola della traccia: *"the replica
+  that knows the most recent update; replica identifiers are used to break
+  ties"*. Massimo secondo l'ordine naturale di `UpdateID` (lessicografico su
+  `<epoch, sequence>`, quindi un epoch più alto batte qualunque sequence), e a
+  parità di `UpdateID` vince l'**id più alto**. È una funzione pura del solo
+  payload: ogni replica che vede il giro completo del ring calcola lo stesso
+  vincitore senza round aggiuntivi. Payload vuoto → `IllegalArgumentException`
+  (situazione impossibile: chi avvia l'elezione ci mette almeno sé stesso).
+- **`latestOf`** è il ponte con la history: `latestId()` oppure `NONE` se la
+  replica non ha ancora deliverato niente. Rende impossibile mettere un
+  `null` nel payload.
+- **`withEntry`** produce il payload da forwardare: copia + entry propria, con
+  `putIfAbsent`. La scelta *"first writer wins"* traduce il *"if it is not
+  already participating in the election, it adds its own information"* della
+  traccia: se rivedo il mio id, il messaggio ha completato il giro e il
+  payload deve restare **identico** a quello visto da tutti gli altri,
+  altrimenti repliche diverse potrebbero decidere vincitori diversi. Ritorna
+  una mappa `unmodifiable` e **non muta** l'input (il messaggio `Election` che
+  ho ricevuto resta immutabile, traccia §2).
+- **`newEpoch`** calcola `max(epoch visti) + 1`. Il massimo è preso su **tutto
+  il payload**, non solo sulla history del vincitore: se una replica ha visto
+  un epoch più alto (perché era rimasta indietro un'elezione ma aveva ricevuto
+  un update di un epoch successivo), riusare un epoch già speso romperebbe
+  l'unicità degli `UpdateID`. Con history tutte vuote dà `1`, coerente col
+  fatto che il coordinatore iniziale lavora in epoch `0`.
+
+### `SyncPlan` — diff della sincronizzazione
+
+```java
+static List<Update> missingFor(UpdateHistory winnerHistory, UpdateID recipientLatest);
+static List<Update> missingForAll(UpdateHistory winnerHistory, Map<Integer, UpdateID> latestPerReplica);
+static UpdateID     oldest(Map<Integer, UpdateID> latestPerReplica);
+```
+
+È la metà "safety-critical" dello sprint: serve a garantire la property della
+traccia §1 (*"if a replica a applies an update w, then all correct replicas
+will eventually apply w"*).
+
+- **`missingFor`** è il seam previsto dal contratto sopra
+  `UpdateHistory.after(...)`: il livello di elezione non tocca mai gli
+  interni della history. Rimane totale anche nei casi degeneri (destinatario
+  più avanti del vincitore → lista vuota, mai un risultato "negativo").
+- **`missingForAll` + `oldest`** sono un'aggiunta rispetto agli stub di Fase 0
+  (§6.2 del contratto), **additiva** e quindi non rompe nulla per A. Motivo:
+  `Synchronization` come congelata in §2 del contratto è un **broadcast unico**
+  con una sola `List<Update> pendingUpdates`, quindi il vincitore non può
+  spedire una lista personalizzata per destinatario. La lista da mettere nel
+  broadcast è allora il diff calcolato rispetto alla **replica più indietro**,
+  cioè il minimo dei `latestId` presenti nel payload della `Election`
+  (`oldest`). Chi ha già applicato una parte di quegli update semplicemente li
+  scarta: la consegna è idempotente sull'`UpdateID` (property "Integrity": una
+  sola delivery per messaggio) — **nota per l'integrazione [A+B]: il
+  destinatario della `Synchronization` deve filtrare gli `Update` con
+  `id <= proprio latestId` prima di applicarli**, altrimenti
+  `callbackOnUpdateApplied` verrebbe chiamata due volte per la stessa write.
+
+### Decisioni di Fase 0 seguite
+
+Nel codice ho seguito le raccomandazioni già scritte in `CONTRACT_PHASE0.md`
+§7; segnalo quali toccano il mio pezzo, da confermare insieme prima del merge:
+
+| Decisione | Scelta adottata nel codice [B] | Note |
+|-----------|--------------------------------|------|
+| **D1** — correlazione `ElectionAck` | ack vuoto, come da raccomandazione | non impatta il package `election/` (nessuna delle tre classi lo tocca); si rivaluta in `[A+B]` se emergono ack stantii |
+| **D2** — sentinella history vuota | `ElectionLogic.NONE = <0,0>` | congelata; c'è un test che verifica `NONE < <0,1>`, cioè che sia più piccola di qualunque id reale |
+| **D3** — calcolo di `newEpoch` | `max(epoch visti) + 1` via `ElectionLogic.newEpoch` | vedi sopra sul perché il massimo è su tutto il payload |
+| **D4** — write durante `ELECTION` | non impatta [B] | resta ad A / integrazione |
+| **D5** — sorgente del set `suspected` | `RingTopology` lo riceve come parametro, non lo possiede | la `Replica` (A) resta l'unica proprietaria del set |
+
+### Test
+
+Package `src/test/java/it/unitn/ds/election/`, JUnit 5, nessun `ActorSystem`.
+**60 test, tutti verdi** (22 + 22 + 16).
+
+```bash
+./gradlew test --tests "it.unitn.ds.election.*"
+```
+
+Cosa coprono, oltre al caso nominale:
+
+- `RingTopologyTest` (22) — ordinamento e deduplicazione, uso diretto di
+  `group.keySet()`, immutabilità dello snapshot, successore semplice,
+  wrap-around, id non contigui, **giro completo del ring** che visita ogni
+  replica esattamente una volta, ring da un solo membro e ring vuoto, skip di
+  uno / di due sospettati consecutivi / attraverso il wrap-around, tutti
+  sospettati → `Optional.empty()`, `self` sospettato o fuori dal ring,
+  argomenti `null`.
+- `ElectionLogicTest` (22) — vincitore singolo, replica più aggiornata,
+  epoch che batte la sequence, tie-break sull'id più alto, tie-break che si
+  applica **solo** fra le repliche più aggiornate (un id alto ma indietro non
+  vince), tutte le history vuote → vince l'id più alto, indipendenza
+  dall'ordine di iterazione della mappa, payload vuoto e `null`;
+  `latestOf` su history vuota e piena; `withEntry` che aggiunge, che preserva
+  l'entry già presente, che non muta la sorgente e che ritorna
+  `unmodifiable`; `newEpoch` nei casi base e nel caso in cui un partecipante
+  ha visto un epoch più alto del vincitore.
+- `SyncPlanTest` (16) — catch-up completo da history vuota, catch-up
+  parziale, replica allineata, replica più avanti del vincitore, ordine
+  totale preservato nel diff, diff che attraversa il **confine di epoch**
+  (update orfano dell'epoch precedente), history del vincitore vuota,
+  immutabilità del risultato, `oldest` come minimo del payload (con confronto
+  epoch-prima-di-sequence), broadcast che copre la replica più indietro,
+  broadcast vuoto quando sono tutti allineati, payload vuoto e `null`.
+
+Nessuna regressione: `./gradlew test --tests "*NoCrashes*"` resta verde (4/4);
+`WithCrashes` e i casi `APICompliance` su crash/elezione restano rossi come
+atteso finché Sprint 2 e l'integrazione `[A+B]` non sono chiusi.
+
+### Cosa manca dello Sprint 3 (tutto `[A+B]`, da fare in pair)
+
+Il package `election/` è completo per la parte statica; resta il cablaggio
+dentro `Replica.java`, che per contratto è di A fino al merge:
+
+1. behavior `election()` separato (`become`) con i soli `Election`,
+   `ElectionAck`, `ElectionAckTimeout`, `GlobalElectionTimeout`,
+   `Synchronization`, `Crash`;
+2. trigger dell'elezione dall'`HeartbeatTimeout` / `UpdateTimeout` /
+   `ForwardTimeout` dello Sprint 2 (oggi logging-only);
+3. `ElectionAckTimeout` → aggiunta del successore silenzioso a `suspected` e
+   nuova chiamata a `RingTopology.successor(...)`;
+4. broadcast della `Synchronization` con `SyncPlan.missingForAll(...)` e
+   `ElectionLogic.newEpoch(...)`, **dopo** aver completato gli update
+   pendenti e prima di riprendere le write;
+5. filtro di idempotenza sugli `Update` replayati (vedi nota in `SyncPlan`);
+6. `GlobalElectionTimeout` anti-livelock;
+7. firing di `callbackOnElectionStarted` / `callbackOnCoordinatorElected` con
+   il timing congelato in `CONTRACT_PHASE0.md` §8.
