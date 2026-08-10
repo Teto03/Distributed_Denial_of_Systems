@@ -11,16 +11,19 @@ import java.io.Serializable;
  */
 public final class ForwardTimeout implements Serializable {
 
+    // safer correlation key?
+    public final long reqId;
     public final int index;
     public final int value;
 
-    public ForwardTimeout(int index, int value) {
+    public ForwardTimeout(long reqId, int index, int value) {
+        this.reqId = reqId;
         this.index = index;
         this.value = value;
     }
 
     @Override
     public String toString() {
-        return "ForwardTimeout(idx=" + index + ", val=" + value + ")";
+        return "ForwardTimeout(req=" + reqId + ", idx=" + index + ", val=" + value + ")";
     }
 }

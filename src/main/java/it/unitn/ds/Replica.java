@@ -2,6 +2,9 @@ package it.unitn.ds;
 
 import akka.actor.ActorRef;
 import akka.actor.Props;
+import akka.actor.Cancellable;
+
+import scala.concurrent.duration.Duration;
 
 import java.io.Serializable;
 import java.util.HashMap;
@@ -9,6 +12,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import it.unitn.ds.messages.ClientRead;
 import it.unitn.ds.messages.ClientWrite;
@@ -18,6 +22,10 @@ import it.unitn.ds.messages.UpdateAck;
 import it.unitn.ds.messages.UpdateMsg;
 import it.unitn.ds.messages.WriteOk;
 import it.unitn.ds.messages.WriteReply;
+import it.unitn.ds.messages.Heartbeat;
+import it.unitn.ds.messages.HeartbeatTimeout;
+import it.unitn.ds.messages.ForwardTimeout;
+import it.unitn.ds.messages.UpdateTimeout;
 
 /**
  * A replica of the shared integer array. Reads are served locally; writes go
@@ -51,8 +59,31 @@ public class Replica extends AbstractReplica {
     // Updates received in phase 1 and still waiting for their WRITEOK.
     private final Map<UpdateID, UpdateMsg> pendingUpdates = new HashMap<>();
 
+    // Armed UpdateTimeout per update id (phase-1 ack -> WRITEOK window),
+    // cancelled as soon as the matching WriteOk arrives.
+    private final Map<UpdateID, Cancellable> updateTimeouts = new HashMap<>();
+    // Armed ForwardTimeout per client request id (forwarded write -> UpdateMsg
+    // window), cancelled as soon as the matching UpdateMsg arrives. Keyed by
+    // reqId rather than (index, value): two different requests can target the
+    // same pair (e.g. a client retry), so that alone is not a safe key.
+    private final Map<Long, Cancellable> forwardTimeouts = new HashMap<>();
+
+    // Alessandro
+    // Crash handling
+    private AbstractReplica.Crash pendingCrash = null;
+    private final Map<AbstractReplica.Crash.Type, Integer> messageCounters = new HashMap<>();
+
+    // heartbeat tasks
+    private Cancellable heartbeatTask;
+    private Cancellable heartbeatTimeoutTask;
+
+    // internal message for the coordinator to trigger a heartbeat broadcast
+    private static class SendHeartbeatTick implements Serializable {
+    }
+
     public Replica(int id) {
-        this(id, AbstractReplica.MIN_LATENCY, AbstractReplica.MAX_LATENCY, AbstractReplica.COORDINATOR_BEAT_INTERVAL, Optional.empty());
+        this(id, AbstractReplica.MIN_LATENCY, AbstractReplica.MAX_LATENCY, AbstractReplica.COORDINATOR_BEAT_INTERVAL,
+                Optional.empty());
     }
 
     public Replica(int id, int minLatency, int maxLatency, int coordinatorBeatInterval, Optional<ActorRef> listener) {
@@ -60,12 +91,15 @@ public class Replica extends AbstractReplica {
     }
 
     public static Props props(int id, int minLatency, int maxLatency, int coordinatorBeatInterval) {
-        return Props.create(Replica.class, () -> new Replica(id, minLatency, maxLatency, coordinatorBeatInterval, Optional.empty()));
+        return Props.create(Replica.class,
+                () -> new Replica(id, minLatency, maxLatency, coordinatorBeatInterval, Optional.empty()));
     }
 
     // Props method for automated tests
-    public static Props propsWithListener(int id, int minLatency, int maxLatency, int coordinatorBeatInterval, ActorRef listener) {
-        return Props.create(Replica.class, () -> new Replica(id, minLatency, maxLatency, coordinatorBeatInterval, Optional.ofNullable(listener)));
+    public static Props propsWithListener(int id, int minLatency, int maxLatency, int coordinatorBeatInterval,
+            ActorRef listener) {
+        return Props.create(Replica.class,
+                () -> new Replica(id, minLatency, maxLatency, coordinatorBeatInterval, Optional.ofNullable(listener)));
     }
 
     @Override
@@ -75,8 +109,27 @@ public class Replica extends AbstractReplica {
 
     @Override
     public void crash(AbstractReplica.Crash how_to_crash) {
-        // Crash handling (CRASHED state via become + per-type counters) is
-        // implemented in Sprint 2. For now the happy path never crashes.
+        // Alessandro
+        // Crash
+        this.pendingCrash = how_to_crash;
+
+        // If instruction is to crash immediately (now) after 0 messages, do it.
+        if (how_to_crash.type == AbstractReplica.Crash.Type.Now && how_to_crash.after_n_messages_of_type == 0) {
+            triggerCrash();
+        }
+    }
+
+    private void triggerCrash() {
+        getContext().become(crashed());
+    }
+
+    private Receive crashed() {
+        return receiveBuilder()
+                .matchAny(msg -> {
+                    // Silently drop all messages
+                    // Do not call getContext().stop(getSelf()) as actor should not be stopped
+                })
+                .build();
     }
 
     @Override
@@ -84,6 +137,19 @@ public class Replica extends AbstractReplica {
         this.group = sysInit.group;
         this.coordinatorId = sysInit.coordinator_id;
         log("initialised: N=" + group.size() + ", coordinator=" + coordinatorId);
+
+        // begin ticks
+        if (isCoordinator()) {
+            heartbeatTask = getContext().getSystem().scheduler().scheduleWithFixedDelay(
+                    Duration.Zero(),
+                    Duration.create(getCoordinatorBeatInterval(), TimeUnit.MILLISECONDS),
+                    getSelf(),
+                    new SendHeartbeatTick(),
+                    getContext().getSystem().dispatcher(),
+                    getSelf());
+        } else {
+            resetHeartbeatTimeout();
+        }
     }
 
     @Override
@@ -95,7 +161,54 @@ public class Replica extends AbstractReplica {
                 .match(UpdateMsg.class, this::onUpdateMsg)
                 .match(UpdateAck.class, this::onUpdateAck)
                 .match(WriteOk.class, this::onWriteOk)
+                .match(SendHeartbeatTick.class, tick -> broadcast(new Heartbeat()))
+                .match(Heartbeat.class, this::onHeartbeat)
+                .match(HeartbeatTimeout.class, this::onHeartbeatTimeout)
+                .match(ForwardTimeout.class, this::onForwardTimeout)
+                .match(UpdateTimeout.class, this::onUpdateTimeout)
                 .build();
+    }
+
+    // =================================================================================
+    // Heartbeat behaviour
+    // =================================================================================
+
+    private void resetHeartbeatTimeout() {
+        if (heartbeatTimeoutTask != null) {
+            heartbeatTimeoutTask.cancel();
+        }
+
+        // Using multiple of 3
+        heartbeatTimeoutTask = getContext().getSystem().scheduler().scheduleOnce(
+                Duration.create(getCoordinatorBeatInterval() * 3L, TimeUnit.MILLISECONDS),
+                getSelf(),
+                new HeartbeatTimeout(),
+                getContext().getSystem().dispatcher(),
+                getSelf());
+    }
+
+    private void onHeartbeat(Heartbeat msg) {
+        if (!checkCrashCondition(AbstractReplica.Crash.Type.Heartbeat))
+            return;
+
+        if (!isCoordinator()) {
+            resetHeartbeatTimeout();
+        }
+    }
+
+    private void onHeartbeatTimeout(HeartbeatTimeout msg) {
+        log("HEARTBEAT TIMEOUT: Coordinator " + coordinatorId + " is suspected to have crashed");
+        // Start or ring election?
+    }
+
+    private void onForwardTimeout(ForwardTimeout msg) {
+        forwardTimeouts.remove(msg.reqId);
+        log("FORWARD TIMEOUT for req=" + msg.reqId + " idx=" + msg.index + " val=" + msg.value);
+    }
+
+    private void onUpdateTimeout(UpdateTimeout msg) {
+        updateTimeouts.remove(msg.id);
+        log("UPDATE TIMEOUT for " + msg.id);
     }
 
     // =================================================================================
@@ -126,6 +239,8 @@ public class Replica extends AbstractReplica {
         } else {
             log("forwarding WRITE (idx=" + msg.index + ", val=" + msg.value + ") to coordinator " + coordinatorId);
             tell(new ForwardWrite(msg.index, msg.value, client, id, msg.reqId), group.get(coordinatorId));
+
+            scheduleForwardTimeout(msg.reqId, msg.index, msg.value);
         }
     }
 
@@ -148,9 +263,19 @@ public class Replica extends AbstractReplica {
 
     /** Every replica acks a phase-1 proposal and remembers it until WRITEOK. */
     private void onUpdateMsg(UpdateMsg msg) {
+        // Crash check and timeout reset
+        if (!checkCrashCondition(AbstractReplica.Crash.Type.Update))
+            return;
+        if (!isCoordinator())
+            resetHeartbeatTimeout();
+
+        cancelTimeout(forwardTimeouts.remove(msg.reqId));
+
         pendingUpdates.put(msg.update.id, msg);
         log("ACK " + msg.update.id + " to coordinator " + coordinatorId);
         tell(new UpdateAck(msg.update.id), group.get(coordinatorId));
+
+        scheduleUpdateTimeout(msg.update.id);
     }
 
     /** Coordinator: count acks, and on quorum tell everyone to commit. */
@@ -169,6 +294,14 @@ public class Replica extends AbstractReplica {
 
     /** Every replica delivers the update; the contacted one answers the client. */
     private void onWriteOk(WriteOk msg) {
+        // Crash check and timeout reset
+        if (!checkCrashCondition(AbstractReplica.Crash.Type.WriteOK))
+            return;
+        if (!isCoordinator())
+            resetHeartbeatTimeout();
+
+        cancelTimeout(updateTimeouts.remove(msg.id));
+
         UpdateMsg proposal = pendingUpdates.remove(msg.id);
         if (proposal == null) {
             // Either already delivered or never seen: nothing to do.
@@ -206,4 +339,59 @@ public class Replica extends AbstractReplica {
         }
     }
 
+    /** Cancels a scheduled timer, if it hasn't fired yet */
+    private void cancelTimeout(Cancellable c) {
+        if (c != null) {
+            c.cancel();
+        }
+    }
+
+    /**
+     * (Re-)arms the ForwardTimeout for a forwarded write, cancelling any
+     * previous timer for the same request first (same rationale as
+     * resetHeartbeatTimeout: rescheduling onto the same variable without
+     * cancelling leaves the old timer live).
+     */
+    private void scheduleForwardTimeout(long reqId, int index, int value) {
+        cancelTimeout(forwardTimeouts.remove(reqId));
+        Cancellable task = getContext().getSystem().scheduler().scheduleOnce(
+                Duration.create(getCoordinatorBeatInterval() * 3L, TimeUnit.MILLISECONDS),
+                getSelf(),
+                new ForwardTimeout(reqId, index, value),
+                getContext().getSystem().dispatcher(),
+                getSelf());
+        forwardTimeouts.put(reqId, task);
+    }
+
+    /**
+     * (Re-)arms the UpdateTimeout for a phase-1 proposal we just ack'd,
+     * cancelling any previous timer for the same update id first.
+     */
+    private void scheduleUpdateTimeout(UpdateID updateID) {
+        cancelTimeout(updateTimeouts.remove(updateID));
+        Cancellable task = getContext().getSystem().scheduler().scheduleOnce(
+                Duration.create(getCoordinatorBeatInterval() * 3L, TimeUnit.MILLISECONDS),
+                getSelf(),
+                new UpdateTimeout(updateID),
+                getContext().getSystem().dispatcher(),
+                getSelf());
+        updateTimeouts.put(updateID, task);
+    }
+
+    /**
+     * Increments the counter for the given message type.
+     * Returns true if the replica should process the message,
+     * or false if the replica just crashed and should drop it.
+     */
+    private boolean checkCrashCondition(AbstractReplica.Crash.Type type) {
+        if (pendingCrash != null && pendingCrash.type == type) {
+            int currentCount = messageCounters.getOrDefault(type, 0);
+            if (currentCount >= pendingCrash.after_n_messages_of_type) {
+                triggerCrash();
+                return false;
+            }
+            messageCounters.put(type, currentCount + 1);
+        }
+        return true;
+    }
 }
