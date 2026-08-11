@@ -7,17 +7,29 @@ import akka.actor.Cancellable;
 import scala.concurrent.duration.Duration;
 
 import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
+import it.unitn.ds.election.ElectionLogic;
+import it.unitn.ds.election.RingTopology;
+import it.unitn.ds.election.SyncPlan;
 import it.unitn.ds.messages.ClientRead;
 import it.unitn.ds.messages.ClientWrite;
+import it.unitn.ds.messages.Election;
+import it.unitn.ds.messages.ElectionAck;
+import it.unitn.ds.messages.ElectionAckTimeout;
 import it.unitn.ds.messages.ForwardWrite;
+import it.unitn.ds.messages.GlobalElectionTimeout;
 import it.unitn.ds.messages.ReadReply;
+import it.unitn.ds.messages.Synchronization;
 import it.unitn.ds.messages.UpdateAck;
 import it.unitn.ds.messages.UpdateMsg;
 import it.unitn.ds.messages.WriteOk;
@@ -69,6 +81,13 @@ public class Replica extends AbstractReplica {
     private final Map<Long, Cancellable> forwardTimeouts = new HashMap<>();
 
     // Alessandro
+    // Client writes this replica was contacted for and has not answered yet.
+    // The client never retries on its own, so a write whose coordinator died
+    // mid-flight is replayed to the new coordinator once the election ends
+    // (see replayPendingClientWrites). Insertion order is kept so that the
+    // per-client FIFO order of requests survives the replay.
+    private final Map<Long, PendingClientWrite> clientWrites = new LinkedHashMap<>();
+
     // Crash handling
     private AbstractReplica.Crash pendingCrash = null;
     private final Map<AbstractReplica.Crash.Type, Integer> messageCounters = new HashMap<>();
@@ -77,8 +96,39 @@ public class Replica extends AbstractReplica {
     private Cancellable heartbeatTask;
     private Cancellable heartbeatTimeoutTask;
 
+    // Election state
+    // Replicas known to be dead: the crashed coordinator plus every successor
+    // that failed to ACK an Election. Crashed replicas never recover, so the
+    // set only grows.
+    private final Set<Integer> suspected = new HashSet<>();
+    // True while this replica is in the election behaviour
+    private boolean participating = false;
+    // Guards callbackOnElectionStarted to at most one call per election, even
+    // if the round is restarted by the GlobalElectionTimeout
+    private boolean electionStartedFired = false;
+    // Last election payload forwarded, replayed when a successor is skipped
+    private Election lastForwardedElection = null;
+
+    private Cancellable electionAckTimeoutTask;
+    private Cancellable globalElectionTimeoutTask;
+
     // internal message for the coordinator to trigger a heartbeat broadcast
     private static class SendHeartbeatTick implements Serializable {
+    }
+
+    /** A client write awating its WriteReply, kept so it can be replayed */
+    private static final class PendingClientWrite {
+        final long reqId;
+        final int index;
+        final int value;
+        final ActorRef client;
+
+        PendingClientWrite(long reqId, int index, int value, ActorRef client) {
+            this.reqId = reqId;
+            this.index = index;
+            this.value = value;
+            this.client = client;
+        }
     }
 
     public Replica(int id) {
@@ -120,6 +170,7 @@ public class Replica extends AbstractReplica {
     }
 
     private void triggerCrash() {
+        cancelAllTimers();
         getContext().become(crashed());
     }
 
@@ -140,17 +191,15 @@ public class Replica extends AbstractReplica {
 
         // begin ticks
         if (isCoordinator()) {
-            heartbeatTask = getContext().getSystem().scheduler().scheduleWithFixedDelay(
-                    Duration.Zero(),
-                    Duration.create(getCoordinatorBeatInterval(), TimeUnit.MILLISECONDS),
-                    getSelf(),
-                    new SendHeartbeatTick(),
-                    getContext().getSystem().dispatcher(),
-                    getSelf());
+            startHeartbeatLoop();
         } else {
             resetHeartbeatTimeout();
         }
     }
+
+    // =================================================================================
+    // Behaviours
+    // =================================================================================
 
     @Override
     public final Receive createReceive() {
@@ -166,6 +215,39 @@ public class Replica extends AbstractReplica {
                 .match(HeartbeatTimeout.class, this::onHeartbeatTimeout)
                 .match(ForwardTimeout.class, this::onForwardTimeout)
                 .match(UpdateTimeout.class, this::onUpdateTimeout)
+                // A replica that has not detected the crash yet can be pulled
+                // into a round, or learn its outcome, while still in NORMAL.
+                .match(Election.class, this::onElection)
+                .match(ElectionAck.class, this::onElectionAck)
+                .match(ElectionAckTimeout.class, this::onElectionAckTimeout)
+                .match(GlobalElectionTimeout.class, this::onGlobalElectionTimeout)
+                .match(Synchronization.class, this::onSynchronization)
+                .build();
+    }
+
+    /**
+     * ELECTION. Built on the base builder so that {@code Crash} keeps going
+     * through the mandatory wrapper (log + listener notification).
+     *
+     * <p>
+     * Reads are still served locally — they never involve the coordinator.
+     * Incoming client writes are parked, not dropped, and replayed to the new
+     * coordinator when the round ends. Everything else of the dying epoch
+     * ({@code UpdateMsg}, {@code WriteOk}, heartbeats and their timeouts) is
+     * ignored: this is what freezes the latest known update of a candidate for
+     * the whole duration of the round (Hint 1).
+     * </p>
+     */
+    private Receive election() {
+        return createBaseReceiveBuilder()
+                .match(ClientRead.class, this::onClientRead)
+                .match(ClientWrite.class, this::onClientWriteDuringElection)
+                .match(Election.class, this::onElection)
+                .match(ElectionAck.class, this::onElectionAck)
+                .match(ElectionAckTimeout.class, this::onElectionAckTimeout)
+                .match(GlobalElectionTimeout.class, this::onGlobalElectionTimeout)
+                .match(Synchronization.class, this::onSynchronization)
+                .matchAny(msg -> debug("ignored while in ELECTION: " + msg))
                 .build();
     }
 
@@ -173,10 +255,27 @@ public class Replica extends AbstractReplica {
     // Heartbeat behaviour
     // =================================================================================
 
+    private void startHeartbeatLoop() {
+        cancelTimeout(heartbeatTimeoutTask);
+        heartbeatTimeoutTask = null;
+        cancelTimeout(heartbeatTask);
+        heartbeatTask = getContext().getSystem().scheduler().scheduleWithFixedDelay(
+                Duration.Zero(),
+                Duration.create(getCoordinatorBeatInterval(), TimeUnit.MILLISECONDS),
+                getSelf(),
+                new SendHeartbeatTick(),
+                getContext().getSystem().dispatcher(),
+                getSelf());
+    }
+
+    private void rearmHeartbeatTimeout() {
+        cancelTimeout(heartbeatTask);
+        heartbeatTask = null;
+        resetHeartbeatTimeout();
+    }
+
     private void resetHeartbeatTimeout() {
-        if (heartbeatTimeoutTask != null) {
-            heartbeatTimeoutTask.cancel();
-        }
+        cancelTimeout(heartbeatTimeoutTask);
 
         // Using multiple of 3
         heartbeatTimeoutTask = getContext().getSystem().scheduler().scheduleOnce(
@@ -197,18 +296,27 @@ public class Replica extends AbstractReplica {
     }
 
     private void onHeartbeatTimeout(HeartbeatTimeout msg) {
+        if (isCoordinator())
+            return;
         log("HEARTBEAT TIMEOUT: Coordinator " + coordinatorId + " is suspected to have crashed");
-        // Start or ring election?
+        startElection(coordinatorId);
     }
 
     private void onForwardTimeout(ForwardTimeout msg) {
         forwardTimeouts.remove(msg.reqId);
-        log("FORWARD TIMEOUT for req=" + msg.reqId + " idx=" + msg.index + " val=" + msg.value);
+        if (isCoordinator())
+            return;
+        log("FORWARD TIMEOUT for req=" + msg.reqId + " idx=" + msg.index + " val=" + msg.value
+                + ": coordinator " + coordinatorId + " did not start the broadcast");
+        startElection(coordinatorId);
     }
 
     private void onUpdateTimeout(UpdateTimeout msg) {
         updateTimeouts.remove(msg.id);
-        log("UPDATE TIMEOUT for " + msg.id);
+        if (isCoordinator())
+            return;
+        log("UPDATE TIMEOUT for " + msg.id + ": no WRITEOK from coordinator " + coordinatorId);
+        startElection(coordinatorId);
     }
 
     // =================================================================================
@@ -233,14 +341,39 @@ public class Replica extends AbstractReplica {
      * request to the coordinator keeping track of who must be answered.
      */
     private void onClientWrite(ClientWrite msg) {
-        ActorRef client = getSender();
-        if (isCoordinator()) {
-            startUpdate(msg.index, msg.value, client, id, msg.reqId);
-        } else {
-            log("forwarding WRITE (idx=" + msg.index + ", val=" + msg.value + ") to coordinator " + coordinatorId);
-            tell(new ForwardWrite(msg.index, msg.value, client, id, msg.reqId), group.get(coordinatorId));
+        PendingClientWrite w = new PendingClientWrite(msg.reqId, msg.index, msg.value, getSender());
+        clientWrites.put(w.reqId, w);
+        submitClientWrite(w);
+    }
 
-            scheduleForwardTimeout(msg.reqId, msg.index, msg.value);
+    /** During an election there is no coordinator to forward to: park it */
+    private void onClientWriteDuringElection(ClientWrite msg) {
+        log("WRITE (idx=" + msg.index + ", val=" + msg.value + ") buffered: election is in progress");
+        clientWrites.put(msg.reqId, new PendingClientWrite(msg.reqId, msg.index, msg.value, getSender()));
+    }
+
+    /** Send (or re-send) a client write towards the current coordinator */
+    private void submitClientWrite(PendingClientWrite w) {
+        if (isCoordinator()) {
+            startUpdate(w.index, w.value, w.client, id, w.reqId);
+        } else {
+            log("forwarding WRITE (idx=" + w.index + ", val=" + w.value + ") to coordinator " + coordinatorId);
+            tell(new ForwardWrite(w.index, w.value, w.client, id, w.reqId), group.get(coordinatorId));
+            scheduleForwardTimeout(w.reqId, w.index, w.value);
+        }
+    }
+
+    /**
+     * Replay every client write still unanswered towards the coordinator that
+     * has just been elected. Without this the request would be lost forever:
+     * the client issues each request exactly once and only reports a timeout.
+     */
+    private void replayPendingClientWrites() {
+        if (clientWrites.isEmpty())
+            return;
+        log("replaying " + clientWrites.size() + " buffered write(s) to coordinator " + coordinatorId);
+        for (PendingClientWrite w : new ArrayList<>(clientWrites.values())) {
+            submitClientWrite(w);
         }
     }
 
@@ -269,6 +402,7 @@ public class Replica extends AbstractReplica {
         if (!isCoordinator())
             resetHeartbeatTimeout();
 
+        // The coordinator is alive
         cancelTimeout(forwardTimeouts.remove(msg.reqId));
 
         pendingUpdates.put(msg.update.id, msg);
@@ -302,21 +436,306 @@ public class Replica extends AbstractReplica {
 
         cancelTimeout(updateTimeouts.remove(msg.id));
 
-        UpdateMsg proposal = pendingUpdates.remove(msg.id);
+        UpdateMsg proposal = pendingUpdates.get(msg.id);
         if (proposal == null) {
             // Either already delivered or never seen: nothing to do.
             return;
         }
-        Update update = proposal.update;
-        positions[update.index] = update.value;
-        history.append(update);
-        log("applied update " + update.id.epoch + ":" + update.id.sequence
-                + " (" + update.index + ", " + update.value + ")");
-        callbackOnUpdateApplied(update.index, update.value);
+        applyUpdate(proposal.update);
+    }
 
-        if (proposal.contactedReplicaId == id) {
-            tell(new WriteReply(proposal.reqId, update.index, update.value, id), proposal.client);
+    /**
+     * Deliver an update exactly once: write the array, append to the history,
+     * fire the mandatory callback and, if we are the replica the client
+     * contacted, answer it.
+     */
+    private void applyUpdate(Update u) {
+        positions[u.index] = u.value;
+        history.append(u);
+        log("applied update " + u.id.epoch + ":" + u.id.sequence
+                + " (" + u.index + ", " + u.value + ")");
+        callbackOnUpdateApplied(u.index, u.value);
+
+        UpdateMsg proposal = pendingUpdates.remove(u.id);
+        cancelTimeout(updateTimeouts.remove(u.id));
+        if (proposal != null && proposal.contactedReplicaId == id) {
+            clientWrites.remove(proposal.reqId);
+            cancelTimeout(forwardTimeouts.remove(proposal.reqId));
+            tell(new WriteReply(proposal.reqId, u.index, u.value, id), proposal.client);
         }
+    }
+
+    /** True if {@code uid} has already been delivered (the history is ordered) */
+    private boolean alreadyDelivered(UpdateID uid) {
+        return history.latestId().map(latest -> uid.compareTo(latest) <= 0).orElse(false);
+    }
+
+    // =================================================================================
+    // Election
+    // =================================================================================
+
+    /**
+     * Enter ELECTION: build the Election payload with this replica's latestId
+     * and forward it to the ring successor. Fires callbackOnElectionStarted once.
+     */
+    private void startElection(int crashedCoordinatorId) {
+        if (participating || group == null)
+            return;
+
+        participating = true;
+        suspected.add(crashedCoordinatorId);
+
+        // While a candidate we must not suspect anybody on account of heartbeat
+        cancelTimeout(heartbeatTimeoutTask);
+        heartbeatTimeoutTask = null;
+
+        getContext().become(election());
+        fireElectionStartedOnce(crashedCoordinatorId);
+        rearmGlobalElectionTimeout();
+
+        Map<Integer, UpdateID> payload = ElectionLogic.withEntry(
+                Collections.<Integer, UpdateID>emptyMap(), id, ElectionLogic.latestOf(history));
+        forwardElection(new Election(id, payload));
+    }
+
+    /** callbackOnElectionSTarted must fire at most once per election */
+    private void fireElectionStartedOnce(int crashedCoordinatorId) {
+        if (!electionStartedFired) {
+            electionStartedFired = true;
+            callbackOnElectionStarted(crashedCoordinatorId);
+        }
+    }
+
+    /** Hand the election to the next alive replica of the ring */
+    private void forwardElection(Election msg) {
+        lastForwardedElection = msg;
+        Optional<Integer> successor = RingTopology.successor(id, group.keySet(), suspected);
+
+        if (successor.isPresent()) {
+            tell(msg, group.get(successor.get()));
+            rearmElectionAckTimeout(successor.get());
+        } else {
+            // this replica is the only one left aliv
+            log("no alive successor left in the ring, winning by default");
+            becomeWinner(msg.latestPerReplica);
+        }
+    }
+
+    private void onElection(Election msg) {
+        // Check crash condition specifically for election
+        if (!checkCrashCondition(AbstractReplica.Crash.Type.Election))
+            return;
+
+        // ack sender immediately
+        tell(new ElectionAck(), getSender());
+
+        if (isStaleElection(msg)) {
+            debug("dropping stale election " + msg + ": " + coordinatorId + " is already our coordinator");
+            if (isCoordinator()) {
+                // The sender is still stuck in a round we havea lready won:
+                // re-announce our leadership so that it can move on.
+                tell(new Synchronization(id, lastAssignedId.epoch,
+                        SyncPlan.missingForAll(history, msg.latestPerReplica)), getSender());
+            }
+            return;
+        }
+
+        if (!participating) {
+            // Puleld into a round started by somebody else
+            participating = true;
+            suspected.add(coordinatorId);
+            cancelTimeout(heartbeatTimeoutTask);
+            heartbeatTimeoutTask = null;
+            getContext().become(election());
+            // The coordinator we still believe in is the one that crashed
+            fireElectionStartedOnce(coordinatorId);
+            rearmGlobalElectionTimeout();
+        }
+
+        if (msg.latestPerReplica.containsKey(id)) {
+            // Our own entry is back: the message completed a full ring lap, so
+            // the payload is final and every replica computes the same winner
+            // out of it
+            int winnerId = ElectionLogic.winner(msg.latestPerReplica);
+            if (winnerId == id) {
+                becomeWinner(msg.latestPerReplica);
+            } else {
+                // Keep it circulating: it must reach the winner, the only
+                // replica allowed to announce the outcome
+                log("ring lap complete, winner is " + winnerId + ": forwarding");
+                forwardElection(msg);
+            }
+        } else {
+            forwardElection(new Election(msg.initiatorId,
+                    ElectionLogic.withEntry(msg.latestPerReplica, id, ElectionLogic.latestOf(history))));
+        }
+    }
+
+    /**
+     * A straggler from a round that has already been decided: it would elect
+     * the coordinator we are already following, so re-entering ELECTION would
+     * only restart a settled system.
+     */
+    private boolean isStaleElection(Election msg) {
+        if (participating || msg.latestPerReplica.isEmpty() || suspected.contains(coordinatorId)) {
+            return false;
+        }
+        return ElectionLogic.winner(msg.latestPerReplica) == coordinatorId;
+    }
+
+    // handle acks and timeouts
+    private void onElectionAck(ElectionAck msg) {
+        cancelTimeout(electionAckTimeoutTask);
+        electionAckTimeoutTask = null;
+    }
+
+    private void onElectionAckTimeout(ElectionAckTimeout msg) {
+        if (!participating || lastForwardedElection == null) {
+            return;
+        }
+
+        // The successor did not answer: skip it and try the following one
+        suspected.add(msg.successorId);
+        log("ELECTION ACK TIMEOUT: suspecting " + msg.successorId + ", skipping it in the ring");
+        forwardElection(lastForwardedElection);
+    }
+
+    /**
+     * Anti-livelock net (Hint 2): if the round has not converged — typically
+     * because the winner crashed right before announcing itself — start it
+     * again from scratch. The callback is NOT fired again: this is still the
+     * same election participation, just another attempt.
+     */
+    private void onGlobalElectionTimeout(GlobalElectionTimeout msg) {
+        if (!participating)
+            return;
+        log("GLOBAL ELECTION TIMEOUT: restarting the election");
+        cancelTimeout(electionAckTimeoutTask);
+        electionAckTimeoutTask = null;
+        lastForwardedElection = null;
+        participating = false;
+        startElection(coordinatorId);
+    }
+
+    private void rearmElectionAckTimeout(int successorId) {
+        cancelTimeout(electionAckTimeoutTask);
+        electionAckTimeoutTask = scheduleSelf(new ElectionAckTimeout(successorId), getMaxLatencyPlusTolerance());
+    }
+
+    private void rearmGlobalElectionTimeout() {
+        cancelTimeout(globalElectionTimeoutTask);
+        // needs to be long enough for a full ring lap
+        long timeout = group.size() * getMaxLatencyPlusTolerance() * 2L;
+        globalElectionTimeoutTask = scheduleSelf(new GlobalElectionTimeout(), timeout);
+    }
+
+    /**
+     * This replica knows the most recent update: it takes over as coordinator.
+     *
+     * <p>
+     * Order matters. The interrupted updates of the dead epoch are completed
+     * <em>before</em> the new epoch is opened (Hint 3), so that the
+     * {@code Synchronization} carries them and every correct replica converges
+     * to the same state — this is what makes uniform agreement hold when the
+     * old coordinator died after some replica had already applied an update.
+     * </p>
+     */
+    private void becomeWinner(Map<Integer, UpdateID> latestPerReplica) {
+        cancelTimeout(electionAckTimeoutTask);
+        electionAckTimeoutTask = null;
+        cancelTimeout(globalElectionTimeoutTask);
+        globalElectionTimeoutTask = null;
+        participating = false;
+        electionStartedFired = false;
+        lastForwardedElection = null;
+
+        int newEpoch = ElectionLogic.newEpoch(latestPerReplica);
+        log("WON the election, completing interrupted updates before epoch " + newEpoch);
+
+        completeInterruptedUpdates();
+
+        coordinatorId = id;
+        lastAssignedId = new UpdateID(newEpoch, 0);
+        ackCounts.clear();
+        committed.clear();
+
+        // One broadcast for everybody: the diff against the most lagging
+        // participant. Replicas that already delivered part of it skip those
+        // entries, delivery being idempotent on the UpdateID
+        List<Update> missing = SyncPlan.missingForAll(history, latestPerReplica);
+        Synchronization sync = new Synchronization(id, newEpoch, missing);
+        for (Map.Entry<Integer, ActorRef> entry : group.entrySet()) {
+            if (entry.getKey() != id) {
+                tell(sync, entry.getValue());
+            }
+        }
+
+        getContext().become(createReceive());
+        startHeartbeatLoop();
+        callbackOnCoordinatorElected(id);
+        replayPendingClientWrites();
+    }
+
+    /**
+     * Updates this replica acknowledged in phase 1 but never saw confirmed:
+     * the old coordinator may have died after applying them, or after sending
+     * WRITEOK to somebody else. Delivering them now — and shipping them in the
+     * Synchronization — is what prevents a client from having observed a value
+     * that exists nowhere else.
+     */
+    private void completeInterruptedUpdates() {
+        if (pendingUpdates.isEmpty())
+            return;
+        List<UpdateID> ids = new ArrayList<>(pendingUpdates.keySet());
+        Collections.sort(ids);
+        for (UpdateID uid : ids) {
+            UpdateMsg proposal = pendingUpdates.get(uid);
+            if (proposal == null || alreadyDelivered(uid)) {
+                continue;
+            }
+            log("completing interrupted update " + uid);
+            applyUpdate(proposal.update);
+        }
+        pendingUpdates.clear();
+    }
+
+    // Everybody learns the outcome
+    private void onSynchronization(Synchronization msg) {
+        cancelTimeout(electionAckTimeoutTask);
+        electionAckTimeoutTask = null;
+        cancelTimeout(globalElectionTimeoutTask);
+        globalElectionTimeoutTask = null;
+        participating = false;
+        electionStartedFired = false;
+        lastForwardedElection = null;
+
+        coordinatorId = msg.newCoordinatorId;
+        log("SYNCHRONIZATION from " + msg.newCoordinatorId + ": epoch " + msg.newEpoch
+                + ", " + msg.pendingUpdates.size() + " update(s) to replay");
+
+        // The list is ordered so a single pass is enough; entries we already
+        // delivered are skipped
+        for (Update u : msg.pendingUpdates) {
+            if (!alreadyDelivered(u.id)) {
+                applyUpdate(u);
+            }
+        }
+
+        // Anything left over belongs to the dead epoch: from now on the new
+        // coordinator is the only source of truth.
+        for (Cancellable c : updateTimeouts.values()) {
+            cancelTimeout(c);
+        }
+        updateTimeouts.clear();
+        pendingUpdates.clear();
+        ackCounts.clear();
+        committed.clear();
+        lastAssignedId = new UpdateID(msg.newEpoch, 0);
+
+        getContext().become(createReceive());
+        rearmHeartbeatTimeout();
+        callbackOnCoordinatorElected(coordinatorId);
+        replayPendingClientWrites();
     }
 
     // =================================================================================
@@ -341,9 +760,29 @@ public class Replica extends AbstractReplica {
 
     /** Cancels a scheduled timer, if it hasn't fired yet */
     private void cancelTimeout(Cancellable c) {
-        if (c != null) {
+        if (c != null && !c.isCancelled()) {
             c.cancel();
         }
+    }
+
+    /** A crashed replica must stop sending, timers included. */
+    private void cancelAllTimers() {
+        cancelTimeout(heartbeatTask);
+        heartbeatTask = null;
+        cancelTimeout(heartbeatTimeoutTask);
+        heartbeatTimeoutTask = null;
+        cancelTimeout(electionAckTimeoutTask);
+        electionAckTimeoutTask = null;
+        cancelTimeout(globalElectionTimeoutTask);
+        globalElectionTimeoutTask = null;
+        for (Cancellable c : updateTimeouts.values()) {
+            cancelTimeout(c);
+        }
+        updateTimeouts.clear();
+        for (Cancellable c : forwardTimeouts.values()) {
+            cancelTimeout(c);
+        }
+        forwardTimeouts.clear();
     }
 
     /**
@@ -354,13 +793,8 @@ public class Replica extends AbstractReplica {
      */
     private void scheduleForwardTimeout(long reqId, int index, int value) {
         cancelTimeout(forwardTimeouts.remove(reqId));
-        Cancellable task = getContext().getSystem().scheduler().scheduleOnce(
-                Duration.create(getCoordinatorBeatInterval() * 3L, TimeUnit.MILLISECONDS),
-                getSelf(),
-                new ForwardTimeout(reqId, index, value),
-                getContext().getSystem().dispatcher(),
-                getSelf());
-        forwardTimeouts.put(reqId, task);
+        forwardTimeouts.put(reqId,
+                scheduleSelf(new ForwardTimeout(reqId, index, value), getCoordinatorBeatInterval() * 3L));
     }
 
     /**
@@ -369,13 +803,18 @@ public class Replica extends AbstractReplica {
      */
     private void scheduleUpdateTimeout(UpdateID updateID) {
         cancelTimeout(updateTimeouts.remove(updateID));
-        Cancellable task = getContext().getSystem().scheduler().scheduleOnce(
-                Duration.create(getCoordinatorBeatInterval() * 3L, TimeUnit.MILLISECONDS),
+        updateTimeouts.put(updateID,
+                scheduleSelf(new UpdateTimeout(updateID), getCoordinatorBeatInterval() * 3L));
+    }
+
+    /** Schedule a self-message after {@code delayMillis} */
+    private Cancellable scheduleSelf(Serializable msg, long delayMillis) {
+        return getContext().getSystem().scheduler().scheduleOnce(
+                Duration.create(delayMillis, TimeUnit.MILLISECONDS),
                 getSelf(),
-                new UpdateTimeout(updateID),
+                msg,
                 getContext().getSystem().dispatcher(),
                 getSelf());
-        updateTimeouts.put(updateID, task);
     }
 
     /**
