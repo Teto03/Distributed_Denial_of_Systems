@@ -44,8 +44,9 @@ import it.unitn.ds.messages.UpdateTimeout;
  * through the coordinator with the two-phase total order broadcast
  * (UPDATE -> quorum of ACK -> WRITEOK).
  *
- * This class only covers the happy path (no crashes, no election); heartbeat
- * and crash handling come in Sprint 2, the ring election in Sprint 3.
+ * Crashes are emulated by switching to a behaviour that drops everything, and
+ * the loss of the coordinator is recovered by the ring election followed by a
+ * synchronization round.
  */
 public class Replica extends AbstractReplica {
 
@@ -163,8 +164,11 @@ public class Replica extends AbstractReplica {
         // Crash
         this.pendingCrash = how_to_crash;
 
-        // If instruction is to crash immediately (now) after 0 messages, do it.
-        if (how_to_crash.type == AbstractReplica.Crash.Type.Now && how_to_crash.after_n_messages_of_type == 0) {
+        // Now means "stop right away", so there is no message type left to
+        // count: after_n_messages_of_type is ignored on purpose, otherwise a
+        // Crash(Now, n) with n > 0 would arm a condition nobody ever checks and
+        // the replica would stay alive forever.
+        if (how_to_crash.type == AbstractReplica.Crash.Type.Now) {
             triggerCrash();
         }
     }
@@ -210,7 +214,7 @@ public class Replica extends AbstractReplica {
                 .match(UpdateMsg.class, this::onUpdateMsg)
                 .match(UpdateAck.class, this::onUpdateAck)
                 .match(WriteOk.class, this::onWriteOk)
-                .match(SendHeartbeatTick.class, tick -> broadcast(new Heartbeat()))
+                .match(SendHeartbeatTick.class, tick -> broadcast(new Heartbeat(), AbstractReplica.Crash.Type.Heartbeat))
                 .match(Heartbeat.class, this::onHeartbeat)
                 .match(HeartbeatTimeout.class, this::onHeartbeatTimeout)
                 .match(ForwardTimeout.class, this::onForwardTimeout)
@@ -391,7 +395,7 @@ public class Replica extends AbstractReplica {
         Update update = new Update(lastAssignedId, index, value);
         ackCounts.put(lastAssignedId, 0);
         log("UPDATE proposed " + update);
-        broadcast(new UpdateMsg(update, client, contactedReplicaId, reqId));
+        broadcast(new UpdateMsg(update, client, contactedReplicaId, reqId), AbstractReplica.Crash.Type.Update);
     }
 
     /** Every replica acks a phase-1 proposal and remembers it until WRITEOK. */
@@ -422,7 +426,7 @@ public class Replica extends AbstractReplica {
             committed.add(msg.id);
             ackCounts.remove(msg.id);
             log("quorum reached for " + msg.id + " -> WRITEOK");
-            broadcast(new WriteOk(msg.id));
+            broadcast(new WriteOk(msg.id), AbstractReplica.Crash.Type.WriteOK);
         }
     }
 
@@ -701,6 +705,16 @@ public class Replica extends AbstractReplica {
 
     // Everybody learns the outcome
     private void onSynchronization(Synchronization msg) {
+        if (!participating && msg.newCoordinatorId == coordinatorId && msg.newEpoch == lastAssignedId.epoch) {
+            // We have already adopted this announcement. It can come back more
+            // than once because the new coordinator answers every straggler
+            // Election with a Synchronization, and running the handler again
+            // would replay the buffered client writes a second time, turning
+            // one client request into two updates.
+            debug("ignoring a duplicate SYNCHRONIZATION from " + msg.newCoordinatorId);
+            return;
+        }
+
         cancelTimeout(electionAckTimeoutTask);
         electionAckTimeoutTask = null;
         cancelTimeout(globalElectionTimeoutTask);
@@ -751,10 +765,30 @@ public class Replica extends AbstractReplica {
         return group.size() / 2 + 1;
     }
 
-    /** Send a message to every replica in the group (the coordinator included). */
-    private void broadcast(Serializable msg) {
-        for (ActorRef replica : group.values()) {
-            tell(msg, replica);
+    /**
+     * Send a message to every replica in the group (the coordinator included),
+     * walking the group in ascending id order.
+     *
+     * <p>
+     * {@code crashPoint} is the crash type this broadcast exposes: the
+     * condition is evaluated once per recipient, so a {@code Crash(type, n)}
+     * makes the sender die after having served exactly {@code n} replicas and
+     * leaves the others without the message. This is what emulates the
+     * partially disseminated UPDATE / WRITEOK the project description asks to
+     * be able to trigger; the receiving side of the same crash type is
+     * unaffected, since a replica either broadcasts a given message (it is the
+     * coordinator) or receives it, never both. Iterating in id order instead
+     * of on the HashMap values keeps the set of replicas that were served
+     * reproducible from one run to the next.
+     * </p>
+     */
+    private void broadcast(Serializable msg, AbstractReplica.Crash.Type crashPoint) {
+        for (int replicaId : RingTopology.order(group.keySet())) {
+            if (!checkCrashCondition(crashPoint)) {
+                log("crashed while broadcasting " + msg + ": the remaining replicas will not receive it");
+                return;
+            }
+            tell(msg, group.get(replicaId));
         }
     }
 
@@ -821,6 +855,17 @@ public class Replica extends AbstractReplica {
      * Increments the counter for the given message type.
      * Returns true if the replica should process the message,
      * or false if the replica just crashed and should drop it.
+     *
+     * <p>
+     * The counter is shared between the two sides of the protocol: an incoming
+     * message is counted when it is about to be processed (UPDATE, WRITEOK,
+     * HEARTBEAT and ELECTION handlers), an outgoing one is counted once per
+     * recipient inside {@link #broadcast(Serializable, Crash.Type)}. There is
+     * no ambiguity because for any given type a replica is either the one
+     * broadcasting it or one of the receivers. So Crash(Update, n) reads as
+     * "die after having sent the UPDATE to n replicas" on the coordinator and
+     * as "die after having processed n UPDATEs" on everybody else.
+     * </p>
      */
     private boolean checkCrashCondition(AbstractReplica.Crash.Type type) {
         if (pendingCrash != null && pendingCrash.type == type) {

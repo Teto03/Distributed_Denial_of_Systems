@@ -202,7 +202,7 @@ con corpi-stub, così i due branch partono da una base condivisa.
 
 ---
 
-## Sprint 2 — Heartbeat + crash semplici   👤 Owner: **A**
+## Sprint 2 — Heartbeat + crash semplici  ✅ COMPLETATO   👤 Owner: **A**
 
 Obiettivo: il sistema sopravvive a crash isolati di repliche non-coordinatrici
 e rileva la morte del coordinatore (senza ancora rieleggere).
@@ -220,25 +220,31 @@ Riferimento traccia §1 "Crash detection".
 - Implementazione di `crash(Crash how_to_crash)` con contatori per
   `Crash.Type.{Now, Heartbeat, Update, WriteOK, Election}` — semantica
   "after_n_messages_of_type" = processa N, crasha al messaggio N+1
-  (regola 10 codebase).
-- `HeartbeatTimeout`: scatta dopo `coordinatorBeatInterval × k`
-  (k ragionevole, ~3) — registra il crash del coordinatore ma NON parte
-  ancora l'elezione (logging only). Il flag verrà collegato in Sprint 3.
+  (regola 10 codebase). `Now` crasha subito, ignorando il contatore: non c'è
+  un tipo di messaggio da contare.
+- Il contatore è condiviso fra le due direzioni: `broadcast(msg, crashPoint)`
+  valuta la condizione **una volta per destinatario**, così `Crash(Update, n)`
+  e `Crash(WriteOK, n)` sul coordinatore producono un broadcast **parziale**
+  (serve n repliche e muore). È quello che serve per innescare la
+  "partial dissemination" della traccia §1 "Properties".
+- `HeartbeatTimeout`: scatta dopo `coordinatorBeatInterval × 3` e avvia
+  direttamente l'elezione (l'aggancio è stato fatto nell'integrazione
+  `[A+B]` dello Sprint 3, insieme a `ForwardTimeout` e `UpdateTimeout`).
 - `ForwardTimeout` su write: il client riceve `WriteTimeout` se la replica
   contattata non riceve `WriteOk` entro la finestra.
 
-**Exit criteria**:
-- `APICompliance.replicasCrashNow` verde (tutte le repliche reagiscono al
+**Exit criteria** — tutti raggiunti:
+- ✅ `APICompliance.replicasCrashNow` verde (tutte le repliche reagiscono al
   `Crash(Now, 0)`).
-- `APICompliance.crashReplicaAndTryRequests` verde (client va in
+- ✅ `APICompliance.crashReplicaAndTryRequests` verde (client va in
   `ReadTimeout`/`WriteTimeout` quando la replica contattata è crashed).
-- `WithCrashes` superato per i casi in cui crasha una replica
-  non-coordinatrice durante un write (la maggioranza resta viva, l'update
-  passa).
+- ✅ `WithCrashes.nonCoordinatorsCrashClientWritesWaitsReads` verde per
+  N ∈ {7, 22}: crashano `N/2 − 2` repliche non coordinatrici, la write passa
+  lo stesso e la read successiva vede il valore.
 
 ---
 
-## Sprint 3 — Elezione + sincronizzazione
+## Sprint 3 — Elezione + sincronizzazione  ✅ COMPLETATO
 
 Obiettivo: dopo il crash del coordinatore, le repliche eleggono un nuovo
 coordinatore via ring e completano gli update pendenti prima di accettarne
@@ -296,44 +302,63 @@ agreement).
   vincitore alla decisione e su ogni altra replica al processamento di
   `Synchronization` (regola 6 codebase + commenti nei test).
 
-**Punto di merge**: quando A chiude gli exit criteria dello Sprint 2, i due
-integrano le parti statiche [B] dentro la FSM [A]. Da fare insieme perché è
-qui che i due mondi si incontrano e dove vivono le invarianti di safety.
+**Punto di merge**: fatto. Il branch `sprint3-election` è stato mergiato in
+`main` (`6c01abe`) e l'integrazione `[A+B]` è entrata con i due commit
+successivi.
 
-**Exit criteria**:
-- `APICompliance.callbackOnElectionStartedInvokedCorrectly` verde per
+**Exit criteria** — tutti raggiunti:
+- ✅ `APICompliance.callbackOnElectionStartedInvokedCorrectly` verde per
   N ∈ {5,7}.
-- `APICompliance.callbackOnElectionStartedCalledAtMostOncePerReplica`
+- ✅ `APICompliance.callbackOnElectionStartedCalledAtMostOncePerReplica`
   verde.
-- `APICompliance.callbackOnCoordinatorElectedAllAgree` verde.
-- `APICompliance.callbackOnCoordinatorElectedNewCoordAlsoCalls` verde.
+- ✅ `APICompliance.callbackOnCoordinatorElectedAllAgree` verde.
+- ✅ `APICompliance.callbackOnCoordinatorElectedNewCoordAlsoCalls` verde.
+- ✅ `WithCrashes.coordinatorCrashClientWritesWaitsReads` verde per
+  N ∈ {7, 22} con coordinatore + 2 repliche crashate.
+
+**Aggiunte rispetto al piano iniziale**, emerse durante l'integrazione:
+
+- **Buffer delle write durante l'elezione** (`clientWrites` +
+  `replayPendingClientWrites`). Il client emette ogni richiesta una sola volta
+  e non ritenta: senza buffer, una write il cui coordinatore muore a metà
+  andrebbe persa. Le write che arrivano in stato `ELECTION` sono parcheggiate
+  (decisione D4) e rigiocate verso il nuovo coordinatore.
+- **Guardia sulle `Election` stantie** (`isStaleElection`): un messaggio
+  ritardatario di un round già deciso eleggerebbe il coordinatore che stiamo
+  già seguendo, quindi va scartato invece di far ripartire un sistema ormai
+  stabile.
+- **Idempotenza della `Synchronization`**: la stessa annuncio può tornare più
+  volte, perché il nuovo coordinatore risponde con una `Synchronization` a
+  ogni `Election` ritardataria. Rieseguire l'handler rigiocherebbe le write
+  bufferizzate una seconda volta, trasformando una richiesta del client in due
+  update: il duplicato viene riconosciuto su `(newCoordinatorId, newEpoch)` e
+  ignorato.
 
 ---
 
-## Sprint 4 — Corner case del fault model
+## Sprint 4 — Corner case del fault model  ⚠️ PARZIALE
 
 Obiettivo: tutti i test del codebase (`NoCrashes`, `WithCrashes`,
 `APICompliance`) verdi, inclusi gli scenari che la traccia §1 "Properties"
 chiama "partial dissemination".
 
 Casi minimi da coprire (traccia §2: *"trigger crashes at specific points in
-the protocol execution"*):
+the protocol execution"*). L'istrumentazione per innescarli tutti **c'è**
+(`broadcast(msg, crashPoint)` permette il broadcast parziale); quello che
+manca sono i test automatici dedicati.
 
-1. Coordinatore crasha **durante il broadcast di UPDATE** (ne ha mandato
-   ad alcuni, non a tutti).
-2. Coordinatore crasha **dopo aver mandato WRITEOK ad alcuni** ma non a
-   tutti — uniform agreement: il nuovo coord deve far convergere tutti.
-3. **Due nodi consecutivi del ring** crashano durante l'elezione: il
-   sender salta due hop.
-4. Vincitore dell'elezione **crasha prima di mandare Synchronization** —
-   parte una nuova elezione.
-5. Replica crasha **dopo aver inviato ACK** ma prima di ricevere WriteOk
-   (deve risultare trasparente per gli altri).
-6. Client invia richiesta a replica crashed → `ReadTimeout`/`WriteTimeout`
-   con i campi corretti.
+| # | Caso | Come si innesca | Stato |
+|---|------|-----------------|-------|
+| 1 | Coordinatore crasha **durante il broadcast di UPDATE** | `Crash(Update, k)` sul coordinatore, `k < N` | innescabile, nessun test |
+| 2 | Coordinatore crasha **dopo WRITEOK ad alcuni** — uniform agreement | `Crash(WriteOK, k)` sul coordinatore | innescabile, **coperto dalla Demo 4** |
+| 3 | **Due nodi consecutivi** crashano durante l'elezione | `Crash(Now, 0)` su due id adiacenti | unit test su `RingTopology`, nessun test end-to-end |
+| 4 | Vincitore crasha **prima della Synchronization** | `Crash(Election, k)` sul futuro vincitore | logica presente (`GlobalElectionTimeout`), nessun test |
+| 5 | Replica crasha **dopo l'ACK**, prima del WriteOk | `Crash(Update, 0)` su una non-coordinatrice | innescabile, nessun test |
+| 6 | Client contatta una replica crashed | `Crash(Now, 0)` + richiesta | ✅ `APICompliance.crashReplicaAndTryRequests` |
 
-**Exit criteria**: `./gradlew test` interamente verde, inclusi tutti i
-`@ParameterizedTest` in `WithCrashes`.
+**Exit criteria**: `./gradlew test` interamente verde (✅ oggi: 93/93) **più**
+una suite dedicata ai casi 1-5 sopra, da scrivere in
+`src/test/java/it/unitn/ds/scenarios/`.
 
 ---
 
@@ -341,7 +366,7 @@ the protocol execution"*):
 
 Riferimento traccia §3 (report) e §4 (presentation & submission).
 
-### 5.1 Report LaTeX
+### 5.1 Report LaTeX  ❌ DA FARE
 
 - Template fornito (linkato in traccia §3) — già presente in `report/`.
 - 3-4 pagine, **max 6** ("Reports exceeding this page limit will be
@@ -354,23 +379,32 @@ Riferimento traccia §3 (report) e §4 (presentation & submission).
 - Stato attuale `report/`: skeleton `main.tex` + `01_structure.tex`,
   `02_design.tex`, `03_implementation.tex` — da completare.
 
-### 5.2 Demo scenarios
+### 5.2 Demo scenarios  ✅ COMPLETATO
 
 Traccia §4 raccomanda *"three or four representative execution examples,
-including corner cases"*. Implementare in `Main.java` (o in classi
-`demos/`) almeno:
+including corner cases"*. Implementate in `Main.java`, una per metodo, ognuna
+con il proprio `ActorSystem` creato e terminato, così che il log di uno
+scenario si legga da solo. Tutto passa da `Logger` (niente `System.out`).
 
-- Demo 1 — happy path: 1 client, 3 write su 3 indici diversi, 1 read
-  finale che verifica lo stato.
-- Demo 2 — crash di una replica non-coord: il sistema continua a
-  rispondere; la replica crashata risponde con timeout al client.
-- Demo 3 — crash del coordinatore con elezione e sync: si vede il nuovo
-  coord, le write successive vanno a buon fine.
-- Demo 4 — crash del coord **durante** un UPDATE in corso: si vede
-  l'update orfano completato dal nuovo coord (mostra l'uniform agreement).
+- **Demo 1** — happy path: 1 client su Replica 4, tre write e una read;
+  si vedono gli id consecutivi `<0,1> <0,2> <0,3>` e l'ordine totale
+  rispettato su tutte le repliche.
+- **Demo 2** — crash di una replica non-coordinatrice: la write successiva
+  raggiunge comunque il quorum (3 ack su 5), mentre il client attaccato alla
+  replica morta va in `TIMEOUT READ`.
+- **Demo 3** — crash del coordinatore: `HEARTBEAT TIMEOUT` → elezione ad
+  anello → `SYNCHRONIZATION` → la write bufferizzata da Replica 2 viene
+  rigiocata e completata in epoch 1 (`<1,1>`).
+- **Demo 4** — corner case della safety: `Crash(WriteOK, 2)` fa morire il
+  coordinatore con il WRITEOK consegnato **a una sola replica**. Quella
+  replica è l'unica ad aver applicato `<0,1>`, vince l'elezione perché
+  conosce l'update più recente e lo rimette in circolo con la
+  `Synchronization` — uniform agreement dimostrata dal vivo.
 
-Ogni demo deve produrre log puliti e leggibili (timestamp + pattern
-ufficiali).
+```bash
+./gradlew run                 # tutti e quattro gli scenari in sequenza
+./gradlew run --args="3"      # solo lo scenario 3
+```
 
 ### 5.3 Checklist di consegna (traccia §4)
 
@@ -396,8 +430,8 @@ ufficiali).
 | §1 Crash detection via timeout                                    | 2      |
 | §1 Ring election, ACK hop-by-hop, skip su timeout                 | 3      |
 | §1 Vincitore = max latest update, tie-break id                    | 3      |
-| §1 Synchronization + completamento update pendenti                | 3,4    |
-| §1 Uniform agreement con crash del coord a metà broadcast         | 4      |
+| §1 Synchronization + completamento update pendenti                | 3      |
+| §1 Uniform agreement con crash del coord a metà broadcast         | 2,3    |
 | §2 Logging formattato e timestamped                               | 1+     |
 | §2 Crashed mode (no `stop`)                                       | 2      |
 | §2 Crash istrumentati per tipo di messaggio                       | 2      |

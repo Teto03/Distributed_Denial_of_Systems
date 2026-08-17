@@ -1,556 +1,1001 @@
 # Stato implementativo
 
 Documento di stato del progetto **Quorum-Based Total Order Broadcast**
-(Distributed Systems 2025-2026). Spiega cosa è stato implementato finora,
-come è stato strutturato e perché. Identificatori, log e nomi di file
-restano in inglese; il commento in prosa è in italiano come da convenzione
-del corso.
+(Distributed Systems 2025-2026). Descrive **cosa è stato implementato, dove
+vive nel codice e perché funziona**, mettendolo a confronto riga per riga con
+la traccia `docs/ds1_project_2026.pdf`. Identificatori, log e report restano in
+inglese; la prosa è in italiano come da convenzione interna.
 
-Per la roadmap completa con criteri di uscita per sprint vedere
-[`ROADMAP.md`](ROADMAP.md).
+- Roadmap per sprint con criteri di uscita → [`ROADMAP.md`](ROADMAP.md)
+- Contratto di interfaccia fra i due flussi di lavoro → [`CONTRACT_PHASE0.md`](CONTRACT_PHASE0.md)
+
+**Ultimo aggiornamento**: 2026-08-17, su `main` (base `d15f887` + le modifiche
+di oggi su `Replica.java` e `Main.java`, ancora non committate).
+Tutti i branch remoti sono allineati: `sprint3-election` è già stato mergiato
+in `main` (`6c01abe`) e non contiene lavoro ulteriore — `main` è l'unica linea
+di sviluppo viva.
 
 ---
 
 ## Indice
 
-1. [Layout del repository](#layout-del-repository)
-2. [Sprint 0 — Setup](#sprint-0--setup-completato)
-3. [Sprint 1.1 — Modello dati](#sprint-11--modello-dati-completato)
-4. [Sprint 1.2 — Messaggi di protocollo](#sprint-12--messaggi-di-protocollo-completato)
-5. [Sprint 1.3 — Client e Replica (happy path)](#sprint-13--client-e-replica-happy-path-completato)
-6. [Cosa non è ancora implementato](#cosa-non-è-ancora-implementato)
-7. [Come compilare ed eseguire i test](#come-compilare-ed-eseguire-i-test)
-8. [Sprint 3 [B] — Parti statiche di elezione e sincronizzazione](#sprint-3-b--parti-statiche-di-elezione-e-sincronizzazione-completato)
+1. [Sintesi: dove siamo](#1-sintesi-dove-siamo)
+2. [Tracciabilità requisiti → codice](#2-tracciabilità-requisiti--codice)
+3. [Layout del repository](#3-layout-del-repository)
+4. [Infrastruttura fornita dalla codebase](#4-infrastruttura-fornita-dalla-codebase)
+5. [Modello dati](#5-modello-dati)
+6. [Catalogo dei messaggi](#6-catalogo-dei-messaggi)
+7. [Percorso di una READ](#7-percorso-di-una-read)
+8. [Percorso di una WRITE (two-phase)](#8-percorso-di-una-write-two-phase)
+9. [Crash detection: heartbeat e timeout](#9-crash-detection-heartbeat-e-timeout)
+10. [Crashed mode e istrumentazione dei crash](#10-crashed-mode-e-istrumentazione-dei-crash)
+11. [Elezione del coordinatore](#11-elezione-del-coordinatore)
+12. [Sincronizzazione e update orfani](#12-sincronizzazione-e-update-orfani)
+13. [Come sono garantite le proprietà di safety](#13-come-sono-garantite-le-proprietà-di-safety)
+14. [Tabella riassuntiva dei timer](#14-tabella-riassuntiva-dei-timer)
+15. [Logging](#15-logging)
+16. [Demo eseguibili](#16-demo-eseguibili)
+17. [Test: cosa esiste e cosa misura](#17-test-cosa-esiste-e-cosa-misura)
+18. [Cosa manca da fare](#18-cosa-manca-da-fare)
+19. [Limitazioni note e assunzioni da dichiarare nel report](#19-limitazioni-note-e-assunzioni-da-dichiarare-nel-report)
+20. [Come compilare ed eseguire](#20-come-compilare-ed-eseguire)
 
 ---
 
-## Layout del repository
+## 1. Sintesi: dove siamo
+
+**Il protocollo è completo e funzionante.** Tutti i 93 test presenti nel
+repository passano, inclusi quelli su crash del coordinatore, elezione e
+sincronizzazione, e i quattro scenari di demo girano end-to-end.
+
+| Sprint | Contenuto | Stato |
+|--------|-----------|-------|
+| 0 | Setup repo, Gradle wrapper, dipendenze | ✅ completato |
+| 1 | Modello dati, messaggi, happy path client/replica | ✅ completato |
+| 2 | Heartbeat, crashed mode, crash istrumentati, timeout | ✅ completato |
+| 3 [B] | Logica pura di ring/vincitore/diff (`election/`) | ✅ completato |
+| 3 [A+B] | Integrazione FSM: trigger, ack-skip, Synchronization, callback | ✅ completato |
+| 4 | Corner case del fault model | ⚠️ **parziale** — tutti innescabili, test dedicati mancanti |
+| 5.1 | Report LaTeX | ❌ **da fare** |
+| 5.2 | Demo eseguibili | ✅ completato |
+| 5.3 | Consegna (archivio, slot, presentazione) | ❌ da fare |
+
+In sostanza: **manca il report e la copertura a test dei corner case**; il
+cuore del sistema c'è tutto ed è dimostrabile dal vivo. Il dettaglio operativo
+è in [§18](#18-cosa-manca-da-fare).
+
+---
+
+## 2. Tracciabilità requisiti → codice
+
+Ogni riga è un requisito della traccia; la colonna "dove" indica il punto
+esatto dell'implementazione.
+
+| Requisito (traccia)                                                    | Dove                                                     | Stato |
+|------------------------------------------------------------------------|----------------------------------------------------------|-------|
+| §1 Ogni replica tiene una copia di `P[]`                                | `Replica.java:54` (`positions[POSITIONS_LIST_LENGTH]`)   | ✅ |
+| §1 Read servita localmente dalla replica contattata                     | `Replica.java:331` `onClientRead`                        | ✅ |
+| §1 Write inoltrata al coordinatore dalla replica contattata             | `Replica.java:360` `submitClientWrite`                   | ✅ |
+| §1 UPDATE broadcast dal coordinatore                                    | `Replica.java:393` `startUpdate`                         | ✅ |
+| §1 ACK da ogni replica                                                  | `Replica.java:402` `onUpdateMsg`                         | ✅ |
+| §1 Quorum `⌊N/2⌋+1`, coordinatore incluso                               | `Replica.java:420` + `quorum()` `:764`                   | ✅ |
+| §1 WRITEOK broadcast e applicazione locale                              | `Replica.java:434` `onWriteOk` → `:456` `applyUpdate`    | ✅ |
+| §1 Id univoco `⟨e,i⟩`, epoch monotona, sequence azzerata a ogni epoch   | `UpdateID.java`, `Replica.java:394`, `:662`              | ✅ |
+| §1 History degli update mantenuta per il recovery                       | `UpdateHistory.java`, `Replica.java:61`                  | ✅ |
+| §1 Timeout su WRITEOK dopo aver ricevuto UPDATE                         | `Replica.java:838` `scheduleUpdateTimeout` + `:318`      | ✅ |
+| §1 Timeout su write inoltrata (coordinatore non avvia il broadcast)     | `Replica.java:828` `scheduleForwardTimeout` + `:309`     | ✅ |
+| §1 HEARTBEAT periodico dal coordinatore                                 | `Replica.java:262` `startHeartbeatLoop`                  | ✅ |
+| §1 Ring definito dall'ordine degli id                                   | `election/RingTopology.java` `order`                     | ✅ |
+| §1 ELECTION accumula l'update più recente noto a ciascuna replica       | `messages/Election.java` + `ElectionLogic.withEntry`     | ✅ |
+| §1 "se non sta già partecipando, aggiunge la propria informazione"      | `ElectionLogic.withEntry` (`putIfAbsent`)                | ✅ |
+| §1 ACK hop-by-hop dell'ELECTION                                         | `Replica.java:534` (ack immediato) + `:624`              | ✅ |
+| §1 Timeout sull'ACK → skip del successore                               | `Replica.java:596` `onElectionAckTimeout`                | ✅ |
+| §1 Vincitore = update più recente, tie-break su id                      | `ElectionLogic.winner`                                   | ✅ |
+| §1 SYNCHRONIZATION per annunciare la leadership                         | `Replica.java:670`                                       | ✅ |
+| §1 Il nuovo coordinatore allinea gli altri prima di riprendere le write | `Replica.java:647` `becomeWinner` (ordine delle fasi)    | ✅ |
+| §1 Completamento degli update interrotti (partial dissemination)        | `Replica.java:690` `completeInterruptedUpdates`          | ✅ |
+| §2 Akka, attori, Java                                                   | tutto il progetto                                        | ✅ |
+| §2 Uso obbligatorio della codebase, `createBaseReceiveBuilder()`        | `Replica.java:210`, `:246`; `Client.java:67`             | ✅ |
+| §2 Canali FIFO con latenza random                                       | `NetworkChannel.java`, usato via `tell()`                | ✅ |
+| §2 Nessuno stato mutabile condiviso; messaggi immutabili                | `messages/*` tutti `final`+`Serializable`+copie difensive| ✅ |
+| §2 Crashed mode senza `stop()`                                          | `Replica.java:181` `crashed()`                           | ✅ |
+| §2 Crash istrumentati per tipo di messaggio                             | `Replica.java:870` `checkCrashCondition`                 | ✅ |
+| §2 Crash **a metà** del broadcast di UPDATE / WRITEOK                   | `Replica.java:785` `broadcast(msg, crashPoint)`          | ✅ |
+| §2 Log con timestamp e formato prescritto                               | `Logger.java` + `log()` in tutta `Replica`               | ✅ |
+| §2 Esecuzione di sequenze di write interlacciate a crash                | `Main.java` (demo 2-4), `WithCrashes`                    | ✅ |
+| §3 Report 3-4 pagine in inglese                                         | `report/`                                                | ❌ vuoto |
+| §4 3-4 scenari di esecuzione rappresentativi                            | `Main.java`                                              | ✅ |
+
+---
+
+## 3. Layout del repository
 
 ```
 SD_PROJECT/
-├── build.gradle                # configurazione Gradle (Akka 2.6 + JUnit 5)
-├── gradlew, gradlew.bat        # wrapper Gradle 9.2.1
-├── gradle/                     # distribuzione wrapper
-├── README.md                   # introduzione al progetto
-├── ROADMAP.md                  # piano per sprint (source-of-truth operativo)
+├── build.gradle                # Akka classic 2.6.13 + JUnit 6, plugin application
+├── gradlew, gradle/            # wrapper Gradle 9.2.1
+├── README.md
+├── ROADMAP.md                  # piano per sprint
+├── CONTRACT_PHASE0.md          # contratto delle interfacce fra i due flussi
 ├── IMPLEMENTATION_STATUS.md    # questo documento
-├── docs/
-│   ├── ds1_project_2026.pdf                # traccia ufficiale
-│   ├── ds1_project_2026_presentation.pdf   # slide di progetto
-│   └── PROGETTO SD.pdf                     # guida di pianificazione interna
-├── report/                     # skeleton report LaTeX (Sprint 5)
+├── docs/                       # traccia, slide, guida di pianificazione interna
+├── report/                     # skeleton LaTeX (main.tex compila, sezioni vuote)
 └── src/
     ├── main/java/it/unitn/ds/
-    │   ├── AbstractClient.java          # codebase obbligatoria (Genetti/Pasquali)
-    │   ├── AbstractReplica.java         # codebase obbligatoria
-    │   ├── Client.java                  # Sprint 1.3 — read/write + timeout
-    │   ├── Replica.java                 # Sprint 1.3 — happy path two-phase
-    │   ├── Logger.java                  # logging timestamped (codebase)
-    │   ├── Main.java                    # entry point demo
-    │   ├── NetworkChannel.java          # canale FIFO con latenza random
-    │   ├── UpdateID.java                # Sprint 1.1
-    │   ├── Update.java                  # Sprint 1.1
-    │   ├── UpdateHistory.java           # Sprint 1.1
-    │   ├── election/                    # Sprint 3 [B] — logica pura di elezione
-    │   │   ├── RingTopology.java        # ordine del ring + successore vivo
-    │   │   ├── ElectionLogic.java       # payload Election + scelta del vincitore
-    │   │   └── SyncPlan.java            # diff degli update da replayare
-    │   └── messages/                    # Sprint 1.2
-    │       ├── ClientRead.java        # Sprint 1.3 (client -> replica)
-    │       ├── ClientWrite.java       # Sprint 1.3 (client -> replica)
-    │       ├── ReadReply.java         # Sprint 1.3 (replica -> client)
-    │       ├── WriteReply.java        # Sprint 1.3 (replica -> client)
-    │       ├── ForwardWrite.java
-    │       ├── UpdateMsg.java
-    │       ├── UpdateAck.java
-    │       ├── WriteOk.java
-    │       ├── Heartbeat.java
-    │       ├── Election.java
-    │       ├── ElectionAck.java
-    │       ├── Synchronization.java
-    │       ├── UpdateTimeout.java
-    │       ├── ForwardTimeout.java
-    │       ├── HeartbeatTimeout.java
-    │       ├── ElectionAckTimeout.java
-    │       └── GlobalElectionTimeout.java
+    │   ├── AbstractClient.java     # CODEBASE — non modificare
+    │   ├── AbstractReplica.java    # CODEBASE — non modificare
+    │   ├── Logger.java             # CODEBASE — logging timestamped
+    │   ├── NetworkChannel.java     # CODEBASE — canale FIFO con ritardo random
+    │   ├── Main.java               # NOSTRO — i quattro scenari di demo
+    │   ├── Client.java             # NOSTRO — 140 righe
+    │   ├── Replica.java            # NOSTRO — il cuore del progetto
+    │   ├── UpdateID.java           # NOSTRO — ⟨epoch, sequence⟩
+    │   ├── Update.java             # NOSTRO — entry della history
+    │   ├── UpdateHistory.java      # NOSTRO — log append-only
+    │   ├── election/               # NOSTRO — logica pura, senza attori
+    │   │   ├── RingTopology.java
+    │   │   ├── ElectionLogic.java
+    │   │   └── SyncPlan.java
+    │   └── messages/               # NOSTRO — 17 POJO immutabili
     └── test/java/it/unitn/ds/
-        ├── TestsCommons.java
-        ├── base/
-        │   ├── NoCrashes.java           # test happy path
-        │   ├── WithCrashes.java         # test con crash istrumentati
-        │   └── APICompliance.java       # test contrattuali codebase
-        └── election/                    # Sprint 3 [B] — unit test puri
-            ├── RingTopologyTest.java
-            ├── ElectionLogicTest.java
-            └── SyncPlanTest.java
+        ├── TestsCommons.java       # CODEBASE — helper e costanti di timing
+        ├── base/                   # CODEBASE — test obbligatori
+        │   ├── NoCrashes.java      (4 casi)
+        │   ├── WithCrashes.java    (4 casi)
+        │   └── APICompliance.java  (25 casi)
+        └── election/               # NOSTRO — unit test puri (60 casi)
 ```
 
-## Sprint 0 — Setup (COMPLETATO)
+---
 
-- Riorganizzazione delle cartelle in `docs/`, `report/`,
-  `src/main/java/it/unitn/ds/`, `src/test/java/it/unitn/ds/base/`.
-- Generato il **Gradle wrapper 9.2.1** (`./gradlew`) per build riproducibili.
-- `build.gradle` configurato con Akka classic 2.6 + JUnit 5.
-- README di progetto.
-- Repository git inizializzato e pushato su
-  `git@github.com:Teto03/Distributed_Denial_of_Systems.git`.
+## 4. Infrastruttura fornita dalla codebase
 
-**Verifica**: `./gradlew build` su clone pulito → BUILD SUCCESSFUL.
+Vincoli che l'implementazione deve rispettare e su cui si appoggia.
+
+**`AbstractReplica`** (`AbstractReplica.java`)
+- Costanti: `MIN_LATENCY=5`, `MAX_LATENCY=20`, `COORDINATOR_BEAT_INTERVAL=1000`,
+  `POSITIONS_LIST_LENGTH=100`.
+- `tell(Serializable, ActorRef)` (`:96`) — **l'unico modo lecito di inviare**.
+  Crea pigramente un attore `NetworkChannel` per ogni destinazione, figlio del
+  mittente, e ci accoda il messaggio. Da qui derivano due proprietà usate in
+  tutto il protocollo: **FIFO per coppia (mittente, destinatario)** e **ritardo
+  casuale in `[5,20) ms`** su ogni hop.
+- `getMaxLatencyPlusTolerance()` (`:88`) = `maxLatency + maxLatency/2 × N` — è
+  la stima "un hop più tolleranza proporzionale alla taglia del sistema", usata
+  per dimensionare l'`ElectionAckTimeout`.
+- `createBaseReceiveBuilder()` (`:385`) — aggancia `Crash` (sempre) e
+  `InitSystem` (finché non inizializzata). **Ogni `Receive` della replica deve
+  partire da qui**, altrimenti i crash non arrivano più: è il motivo per cui
+  anche `election()` (`Replica.java:246`) parte da questo builder e non da
+  `receiveBuilder()`.
+- Callback obbligatorie `final` (non sovrascrivibili): `callbackOnUpdateApplied`,
+  `callbackOnElectionStarted`, `callbackOnCoordinatorElected`. Loggano e
+  notificano il `listener` (la `TestKit` probe nei test).
+- `onCrashMsg` (`:370`) chiama `crash(...)` **e poi** logga `CRASHED` e notifica
+  il listener: il log `CRASHED: WriteOK (2)` compare quindi alla *ricezione* del
+  comando di crash, non quando la replica muore davvero. Nei log della Demo 4 si
+  vede infatti la riga `CRASHED` all'inizio e la morte effettiva tre secondi
+  dopo, a metà del broadcast del WRITEOK.
+
+**`AbstractClient`** — espone `ReadRequest`/`WriteRequest` (i messaggi che il
+*test harness* manda al client), i tipi risultato `ReadResult`/`WriteResult`/
+`ReadTimeout`/`WriteTimeout` e le quattro callback obbligatorie. Da qui la
+scelta di §6: servono messaggi **nostri** per il dialogo client ↔ replica.
+
+**`NetworkChannel`** — un attore per destinazione, coda FIFO, consegna il
+prossimo elemento dopo un ritardo casuale. Nota importante per il fault model:
+i canali sono **figli del mittente e non vengono fermati dal crash**, quindi
+i messaggi già accodati prima del crash vengono comunque recapitati (vedi §19).
 
 ---
 
-## Sprint 1.1 — Modello dati (COMPLETATO)
+## 5. Modello dati
 
-Tre tipi base, tutti `Serializable`, in `src/main/java/it/unitn/ds/`.
+### `UpdateID` — `⟨epoch, sequence⟩`
+Immutabile, `Serializable`, `Comparable` con ordine lessicografico (prima
+`epoch`, poi `sequence`): un epoch più alto batte qualunque sequence. Helper
+`nextInEpoch()` (usato dal coordinatore a ogni proposta) e `nextEpoch()`.
+`toString()` → `<e,i>`.
+Traccia §1: *"Each update is uniquely identified by a pair ⟨e,i⟩ ... Epoch
+numbers increase monotonically ... The sequence number is reset to 0 at the
+beginning of each epoch"*.
 
-### `UpdateID`
+### `Update` — `(UpdateID id, int index, int value)`
+Entry *deliverata* nella history. Nessun `ActorRef` dentro: è la
+rappresentazione persistente e serializzabile del log, indipendente da chi
+l'ha applicata (i dati di routing viaggiano in `UpdateMsg`, non qui). Questo
+permette di rispedirla tale e quale dentro `Synchronization`.
 
-Coppia logica `<epoch, sequence>` che identifica univocamente un update nel
-protocollo two-phase. È **immutabile**, `Serializable`,
-`Comparable<UpdateID>` con ordinamento lessicografico (prima `epoch`, poi
-`sequence`).
-
-Helper di costruzione:
-
-- `nextInEpoch()` → `<epoch, sequence+1>`, usato dal coordinatore quando
-  assegna una nuova UpdateID nello stesso epoch.
-- `nextEpoch()` → `<epoch+1, 0>`, usato dal nuovo coordinatore appena
-  eletto dopo aver completato la fase di sincronizzazione (Sprint 3).
-
-Equals/hashCode su entrambi i campi; `toString()` produce `<e,i>` per i log
-formattati.
-
-Riferimento traccia §1 "Update protocol": *"Each update is uniquely
-identified by a pair ⟨e, i⟩"*.
-
-### `Update`
-
-Record immutabile `(UpdateID id, int index, int value)` che rappresenta
-**una singola entry deliverata** nella history della replica. Nessun
-riferimento a `ActorRef`: questa è la rappresentazione persistente del log
-locale, indipendente dalla replica che l'ha applicata.
-
-Equals/hashCode su `(id, index, value)`; `toString()` rispetta il pattern di
-log: `<e,i> positions[index]=value`.
-
-### `UpdateHistory`
-
-Log **append-only** di `Update` per replica. Logicamente immutabile (solo
-`append()`, mai rimozioni o riordini); istanza mutabile a fini di
-bookkeeping locale. Le API per inviare snapshot via rete passano dalla
-copia difensiva di `asList()`.
-
-Metodi:
-
-- `append(Update)` — aggiunge una entry.
-- `size()`, `isEmpty()` — utility.
-- `latest()` → `Optional<Update>` — ultima entry; usata sia per la scelta
-  del nuovo coordinatore (chi ha il `latestId()` più alto vince) sia come
-  punto di partenza per la sincronizzazione.
-- `latestId()` → `Optional<UpdateID>` — comodo wrapper.
-- `asList()` — snapshot immutabile da serializzare in
-  `Synchronization`.
-- `after(UpdateID threshold)` — sottolista strettamente più recente di
-  `threshold`, ordinata. Servirà nel calcolo dei pending update da
-  replayare in Sync.
-
-Riferimento traccia §1 "Coordinator election": *"the replica that knows
-the most recent update"*.
+### `UpdateHistory` — log append-only
+Solo `append()`, mai rimozioni o riordini. Metodi usati dal protocollo:
+- `latestId()` → `Optional<UpdateID>`: input della scelta del vincitore;
+- `after(threshold)` → entries strettamente più recenti, in ordine: base del
+  diff di sincronizzazione;
+- `asList()` → snapshot `unmodifiable` per la serializzazione.
 
 ---
 
-## Sprint 1.2 — Messaggi di protocollo (COMPLETATO)
+## 6. Catalogo dei messaggi
 
-Sotto-package `it.unitn.ds.messages/` con 13 classi: tutte `final`,
-`Serializable`, campi `public final`, senza setter. La scelta del sub-
-package è quella suggerita dalla guida interna (`PROGETTO SD.pdf`, §3).
+17 classi in `messages/`, tutte `final`, `Serializable`, campi `public final`,
+nessun setter, collezioni copiate difensivamente e wrappate `unmodifiable*`
+(traccia §2: *"any shared objects must be immutable"*).
 
-> **Nota di nomenclatura.** Il ROADMAP iniziale chiamava il broadcast del
-> coordinatore semplicemente `Update`, ma quel nome è già usato dal data
-> class della history (vedi 1.1). Per evitare la collisione il messaggio è
-> stato rinominato in **`UpdateMsg`**, e l'`Update` data class continua a
-> rappresentare l'entry persistita. `UpdateMsg` *wrappa* un `Update` (più
-> i campi di routing client/replica), così la stessa istanza
-> immutabile può essere appesa alla `UpdateHistory` senza
-> riallocazioni.
+> **Nota di nomenclatura.** Il broadcast di fase 1 si chiama `UpdateMsg` e non
+> `Update` per non collidere con la data class della history. `UpdateMsg`
+> *wrappa* un `Update` immutabile, così la stessa istanza può essere appesa
+> alla history senza riallocazioni.
 
-### Protocollo two-phase (happy path)
+### Client ↔ replica (nostri)
 
-| Classe          | Direzione                   | Campi                                                                         | Note |
-|-----------------|-----------------------------|-------------------------------------------------------------------------------|------|
-| `ForwardWrite`  | Replica → Coordinatore      | `int index`, `int value`, `ActorRef client`, `int contactedReplicaId`         | Trasporta `contactedReplicaId` perché il `WriteResult` finale deve avere `fromReplica == replica contattata dal client` (regola 11 della codebase). |
-| `UpdateMsg`     | Coordinatore → Repliche     | `Update update`, `ActorRef client`, `int contactedReplicaId`                  | Phase-1 broadcast. Wrappa un `Update` immutabile + routing info. |
-| `UpdateAck`     | Replica → Coordinatore      | `UpdateID id`                                                                 | Risposta phase-1. Il coordinatore aggrega per `id` fino a `⌊N/2⌋+1` ack. |
-| `WriteOk`       | Coordinatore → Repliche     | `UpdateID id`                                                                 | Phase-2 broadcast. Ogni replica applica `positions[idx]=val`, appende a `UpdateHistory`, chiama `callbackOnUpdateApplied`. |
+| Classe        | Direzione        | Campi                                                     |
+|---------------|------------------|-----------------------------------------------------------|
+| `ClientRead`  | client → replica | `long reqId`, `int index`                                 |
+| `ClientWrite` | client → replica | `long reqId`, `int index`, `int value`                    |
+| `ReadReply`   | replica → client | `reqId`, `index`, `value`, `int fromReplica`              |
+| `WriteReply`  | replica → client | `reqId`, `index`, `value`, `int fromReplica`              |
 
-### Liveness / heartbeat
+Il `reqId` è un contatore locale al client (`Client.java:28`) e serve a
+**accoppiare risposta e timeout alla richiesta che li ha generati** quando ci
+sono più richieste in volo. Per questo viaggia anche dentro `ForwardWrite` e
+`UpdateMsg`: quando il `WriteOk` torna indietro, la replica contattata sa a chi
+rispondere e con quale id.
 
-| Classe       | Direzione                | Campi  | Note |
-|--------------|--------------------------|--------|------|
-| `Heartbeat`  | Coordinatore → Repliche  | nessuno| Definito ora; emissione periodica e `HeartbeatTimeout` arrivano in Sprint 2. |
+### Protocollo two-phase
 
-### Elezione (definita ora, handler in Sprint 3)
+| Classe          | Direzione                | Campi                                                      | Note |
+|-----------------|--------------------------|-------------------------------------------------------------|------|
+| `ForwardWrite`  | replica → coordinatore   | `index`, `value`, `ActorRef client`, `contactedReplicaId`, `reqId` | `contactedReplicaId` è indispensabile: il `WriteResult` finale deve avere `fromReplica` = replica *contattata dal client*, non il coordinatore. |
+| `UpdateMsg`     | coordinatore → repliche  | `Update update`, `ActorRef client`, `contactedReplicaId`, `reqId` | Fase 1. |
+| `UpdateAck`     | replica → coordinatore   | `UpdateID id`                                              | Fase 1, risposta. |
+| `WriteOk`       | coordinatore → repliche  | `UpdateID id`                                              | Fase 2. |
 
-| Classe            | Direzione                 | Campi                                                          | Note |
-|-------------------|---------------------------|----------------------------------------------------------------|------|
-| `Election`        | Replica → Replica (ring)  | `int initiatorId`, `Map<Integer, UpdateID> latestPerReplica`   | Ogni replica accumula il proprio `latestId()` nel map prima di forwardare al successore. Mappa difensivamente copiata + `unmodifiableMap`. |
-| `ElectionAck`     | Replica → Replica (ring)  | nessuno                                                        | Ack hop-by-hop: il sender della `Election` arma un `ElectionAckTimeout` e, se scade, salta il successore silenzioso. |
-| `Synchronization` | Nuovo coord → Repliche    | `int newCoordinatorId`, `int newEpoch`, `List<Update> pendingUpdates` | Il vincitore replaya gli update in flight prima di bumpare l'epoch (uniform agreement recovery). Lista difensivamente copiata + `unmodifiableList`. |
+### Liveness ed elezione
 
-### Timer self-messages
+| Classe            | Direzione                | Campi                                                        |
+|-------------------|--------------------------|--------------------------------------------------------------|
+| `Heartbeat`       | coordinatore → repliche  | — |
+| `Election`        | replica → replica (ring) | `int initiatorId`, `Map<Integer,UpdateID> latestPerReplica` (copia difensiva + `unmodifiableMap`) |
+| `ElectionAck`     | replica → replica        | — (decisione D1: ack vuoto) |
+| `Synchronization` | nuovo coord → repliche   | `int newCoordinatorId`, `int newEpoch`, `List<Update> pendingUpdates` (copia + `unmodifiableList`) |
 
-Tutti `Serializable` per coerenza, anche se schedulati via
-`scheduler().scheduleOnce(...)` (non passano per `NetworkChannel`).
+### Timer self-schedulati
 
-| Classe                   | Trigger                                                                                 | Note |
-|--------------------------|------------------------------------------------------------------------------------------|------|
-| `UpdateTimeout(id)`      | Replica che ha ack-ato ma non riceve `WriteOk(id)` in tempo.                            | Sprint 3 lo collegherà al sospetto del coordinatore. |
-| `ForwardTimeout(idx,val)`| Non-coordinatore che ha inoltrato `ForwardWrite` ma non vede il proprio `WriteOk`.       | Trigger di `WriteTimeout` lato client in Sprint 1. |
-| `HeartbeatTimeout`       | Non-coordinatore che non riceve heartbeat entro `k × coordinatorBeatInterval`.           | Wiring in Sprint 2, hook all'elezione in Sprint 3. |
-| `ElectionAckTimeout(s)`  | Sender di `Election` che non riceve `ElectionAck` dal successore `s`.                    | Lo skip-and-forward riferisce traccia §1: *"a replica that forwards an ELECTION message starts a timeout while waiting for the corresponding ACK"*. |
-| `GlobalElectionTimeout`  | Rete di sicurezza anti-livelock (Hint-2 della guida interna).                            | Riavvia un'elezione da zero se l'attuale non termina. |
-
-### Vincoli di design rispettati
-
-- **Immutabilità**: tutti i campi sono `public final`; le collezioni passano
-  da copia difensiva + `unmodifiable*` (vedi `Election`, `Synchronization`).
-  Necessario per la regola della traccia §2: *"any shared objects must be
-  immutable"*.
-- **Serializable**: presente su ogni classe — anche sui timeout, per
-  uniformità (sebbene non strettamente richiesto per messaggi self).
-- **Nessuna collisione di nomi**: il data class `Update` resta intoccato;
-  il broadcast è `UpdateMsg`.
-- **`toString()` parlanti**: ogni messaggio ha un `toString()` compatto che
-  rispetta lo stile dei log richiesti dalla traccia §2.
-- **`Objects.requireNonNull`** sui riferimenti non opzionali (UpdateID,
-  ActorRef del client, Update wrappato) per fallire presto su bug.
+| Classe                    | Chi lo arma e quando |
+|---------------------------|----------------------|
+| `HeartbeatTimeout`        | ogni non-coordinatore, riarmato a ogni `Heartbeat`/`UpdateMsg`/`WriteOk` ricevuto |
+| `ForwardTimeout(reqId, index, value)` | replica che ha inoltrato una write e non vede partire il broadcast |
+| `UpdateTimeout(UpdateID)` | replica che ha ack-ato la fase 1 e non vede il `WriteOk` |
+| `ElectionAckTimeout(successorId)` | mittente di una `Election` in attesa dell'ack del successore |
+| `GlobalElectionTimeout`   | rete anti-livelock, armata all'ingresso in ELECTION |
 
 ---
 
-## Sprint 1.3 — Client e Replica (happy path) (COMPLETATO)
+## 7. Percorso di una READ
 
-Implementazione del percorso "tutto funziona": nessun crash, nessuna
-elezione. Corrisponde alla traccia §1 ("Client requests" + "Update
-protocol").
+Traccia §1: *"The contacted replica immediately replies with the current value
+stored at that index"*.
 
-### Quattro nuovi messaggi client ↔ replica
+1. `Client.sendRead` (`Client.java:48`) genera un `reqId`, lo mette in
+   `pending`, logga `requesting READ (idx) to Replica_k`, invia `ClientRead` e
+   arma un tick di timeout su sé stesso.
+2. `Replica.onClientRead` (`Replica.java:331`) legge `positions[idx]` e
+   risponde `ReadReply(reqId, idx, value, id)` — `fromReplica` è **la replica
+   contattata**.
+3. `Client.onReadReply` (`Client.java:75`) rimuove il `reqId` da `pending` e,
+   solo se era ancora pendente, invoca `callbackOnReadResult`.
+4. Se il tick scatta prima della risposta, `onReadTick` trova il `reqId` ancora
+   pendente e invoca `callbackOnReadTimeout`.
 
-Le `AbstractClient.ReadRequest`/`WriteRequest` del codebase sono i messaggi
-che il *test harness* manda al client; servivano quindi messaggi propri per
-il dialogo client → replica → client. Sono in `messages/`, tutti immutabili
-e `Serializable`:
+**Scelta implementativa**: nessun `Cancellable` lato client. Il tick è sempre
+schedulato e la mutua esclusione fra "risposta" e "timeout" è realizzata dalla
+semantica di `Set.remove` — vince chi arriva primo, un tick tardivo è
+silenziosamente ignorato. Meno stato, nessuna race.
 
-| Classe        | Direzione        | Campi                                          |
-|---------------|------------------|------------------------------------------------|
-| `ClientRead`  | client → replica | `long reqId`, `int index`                      |
-| `ClientWrite` | client → replica | `long reqId`, `int index`, `int value`         |
-| `ReadReply`   | replica → client | `long reqId`, `int index`, `int value`, `int fromReplica` |
-| `WriteReply`  | replica → client | `long reqId`, `int index`, `int value`, `int fromReplica` |
-
-Il `reqId` è un identificatore locale del client: serve per accoppiare la
-risposta (o il timeout) alla richiesta che l'ha generata quando ci sono più
-richieste in volo. Per questo è stato aggiunto anche a `ForwardWrite` e
-`UpdateMsg`, così viaggia con la write fino al `WriteOk` e la replica
-contattata sa a chi e con quale id rispondere.
-
-### Replica
-
-- `initSystem` salva `group` e `coordinatorId`.
-- `getSystemNumberOfActors` ritorna `group.size()`.
-- **Read**: servita localmente, risponde con `ReadReply(... value=P[idx],
-  fromReplica=self)`.
-- **Write su replica contattata**: se è il coordinatore avvia subito il
-  broadcast, altrimenti inoltra `ForwardWrite` al coordinatore.
-- **Coordinatore**: assegna `<epoch, seq+1>`, broadcasta `UpdateMsg` a tutte
-  le repliche (sé stesso incluso), conta gli `UpdateAck` e al raggiungimento
-  del quorum `⌊N/2⌋+1` broadcasta `WriteOk`.
-- **WriteOk** (ogni replica): applica `P[idx]=val`, appende a
-  `UpdateHistory`, logga `applied update <e>:<i> (idx, val)` e chiama
-  `callbackOnUpdateApplied`. La sola replica contattata risponde al client
-  con `WriteReply` (così `WriteResult.fromReplica` = replica contattata,
-  regola 11).
-
-### Client
-
-- `sendRead`/`sendWrite`: generano un `reqId`, inviano `ClientRead`/
-  `ClientWrite` e armano un timeout self-schedulato.
-- Su `ReadReply`/`WriteReply` chiamano `callbackOnReadResult`/
-  `callbackOnWriteResult`.
-- Il timeout (`ReadTick`/`WriteTick`, messaggi interni inviati solo a sé)
-  fa scattare `callbackOnReadTimeout`/`callbackOnWriteTimeout` **solo** se la
-  risposta non è ancora arrivata: l'arrivo della reply rimuove il `reqId`
-  dall'insieme dei pending, così un tick tardivo viene semplicemente
-  ignorato (niente `Cancellable` da gestire).
-
-`crash(...)` resta volutamente vuota: la modalità `CRASHED` e i contatori
-per tipo sono Sprint 2.
+Le read sono servite **anche durante un'elezione** (`Replica.java:247`): non
+coinvolgono il coordinatore, quindi non c'è motivo di bloccarle. La
+conseguenza è che una read durante l'elezione può restituire un valore che
+non include un update ancora in volo — coerente con la consistenza sequenziale
+richiesta dalla traccia (§1: *"sequential consistency from each replica's point
+of view"*), non con la linearizzabilità.
 
 ---
 
-## Cosa non è ancora implementato
+## 8. Percorso di una WRITE (two-phase)
 
-`Main.java` è ancora uno scaffold (gli scenari di demo sono Sprint 5).
+### Fase 0 — arrivo e inoltro
+`onClientWrite` (`:347`) registra la richiesta in `clientWrites` (una
+`LinkedHashMap` per `reqId`, così l'ordine FIFO per client sopravvive a un
+eventuale replay) e chiama `submitClientWrite` (`:360`):
+- se siamo il coordinatore → `startUpdate` diretto;
+- altrimenti → `ForwardWrite` al coordinatore **e** `ForwardTimeout` armato.
 
-Heartbeat periodico, stato `CRASHED` via `become`, e i contatori di crash
-per tipo (`Crash.Type.{Now, Heartbeat, Update, WriteOK, Election}`) sono in
-**Sprint 2**.
+### Fase 1 — proposta
+`startUpdate` (`:393`) incrementa `lastAssignedId` con `nextInEpoch()`, crea
+l'`Update`, azzera il contatore di ack e fa
+`broadcast(UpdateMsg, Crash.Type.Update)` — il broadcast include **il
+coordinatore stesso**, come richiede la traccia (*"Since the coordinator itself
+is also a replica, the quorum includes the coordinator"*).
 
-Elezione ring, sincronizzazione, completamento degli update orfani sono in
-**Sprint 3**: la logica pura (`election/`) è già pronta — vedi
-[Sprint 3 [B]](#sprint-3-b--parti-statiche-di-elezione-e-sincronizzazione-completato)
-— mentre il cablaggio dentro `Replica` è la parte di integrazione `[A+B]`.
+`onUpdateMsg` (`:402`), su ogni replica:
+1. `checkCrashCondition(Update)` — punto di crash istrumentato;
+2. riarma l'`HeartbeatTimeout` (l'`UpdateMsg` è di per sé prova di vita del
+   coordinatore, non serve aspettare il prossimo heartbeat);
+3. cancella il `ForwardTimeout` di quel `reqId` — il coordinatore *ha* avviato
+   il broadcast;
+4. memorizza la proposta in `pendingUpdates` (mappa `UpdateID → UpdateMsg`);
+5. invia `UpdateAck` e arma l'`UpdateTimeout` per quell'id.
 
-Stato dei test (`./gradlew test`):
+### Fase 2 — commit
+`onUpdateAck` (`:420`) è ignorato da chi non è coordinatore. Il coordinatore
+accumula in `ackCounts`; al raggiungimento di `quorum() = N/2 + 1` marca l'id
+in `committed` (idempotenza: gli ack successivi non rifanno il broadcast) e
+fa `broadcast(WriteOk, Crash.Type.WriteOK)`.
 
-- `NoCrashes` ✅ verde (4/4 casi).
-- `APICompliance` → happy path verde: `oneClientWriteWaitRead` (4/4),
-  `callbackOnUpdateAppliedInvokedOnAllReplicas` (4/4),
-  `callbackOnUpdateAppliedOncePerWrite` (2/2). I casi su crash
-  (`replicasCrashNow`, `crashReplicaAndTryRequests`) ed elezione restano
-  rossi: attesi in Sprint 2/3.
-- `WithCrashes` ❌ atteso rosso (richiede crash + elezione, Sprint 2-3).
+`onWriteOk` (`:434`) su ogni replica: crash check, riarmo dell'heartbeat
+timeout, cancellazione dell'`UpdateTimeout`, e se la proposta è ancora in
+`pendingUpdates` → `applyUpdate`.
 
----
-
-## Come compilare ed eseguire i test
-
-Richiede solo JDK 17+ (no installazione di Gradle separata; il wrapper
-gestisce tutto).
-
-```bash
-# Build completo (compila main + test + esegue test)
-./gradlew build
-
-# Solo compilazione main
-./gradlew compileJava
-
-# Solo compilazione test
-./gradlew compileTestJava
-
-# Esegui solo i test del happy path (utili da Sprint 1.3 in poi)
-./gradlew test --tests "*NoCrashes*"
-
-# Esegui i test contrattuali della codebase
-./gradlew test --tests "*APICompliance*"
-
-# Pulizia totale
-./gradlew clean
+`applyUpdate` (`:456`) è **l'unico punto in cui lo stato cambia**:
+```java
+positions[u.index] = u.value;
+history.append(u);
+log("applied update " + epoch + ":" + sequence + " (" + index + ", " + value + ")");
+callbackOnUpdateApplied(u.index, u.value);
 ```
+poi rimuove la proposta da `pendingUpdates` (garantendo che una seconda
+consegna dello stesso id non riapplichi nulla) e, **solo se
+`contactedReplicaId == id`**, risponde al client con `WriteReply` e libera la
+`clientWrites`. È così che `WriteResult.fromReplica` risulta uguale alla
+replica contattata, come pretendono i test della codebase.
 
-Per la demo interattiva:
-
-```bash
-./gradlew run        # se configurato in build.gradle, lancia Main
-# oppure
-./gradlew compileJava && java -cp build/classes/java/main:$(./gradlew -q printClasspath) it.unitn.ds.Main
-```
-
-(Il `Main.java` corrente è uno scaffold senza client: produrrà solo il
-banner di start/end finché Sprint 5 non aggiungerà gli scenari di demo.)
+Il formato di log è esattamente quello della traccia §2:
+`[Replica <id>] applied update <epoch>:<sequence> (<idx>, <val>)`.
 
 ---
 
-## Sprint 3 [B] — Parti statiche di elezione e sincronizzazione (COMPLETATO)
+## 9. Crash detection: heartbeat e timeout
 
-> **Branch**: `sprint3-election` (partito dal commit di `main` con la Fase 0
-> verde, come previsto da `CONTRACT_PHASE0.md` §9).
->
-> **Perimetro**: solo i task taggati **[B]** in `ROADMAP.md` → Sprint 3, cioè
-> la logica *pura* che non richiede runtime né FSM. Niente è stato toccato
-> fuori dal package `election/` e dai suoi test: **`Replica.java` non è stato
-> modificato**, così il lavoro su Sprint 2 procede in parallelo senza
-> conflitti di merge (ownership di `CONTRACT_PHASE0.md` §1 rispettata).
+Traccia §1 "Crash detection" richiede tre rilevatori distinti; ci sono tutti.
 
-### Perché tutto in un package separato
+**Heartbeat del coordinatore** — `startHeartbeatLoop` (`:262`) usa
+`scheduleWithFixedDelay(Zero, coordinatorBeatInterval)` e si manda un
+`SendHeartbeatTick` (classe interna, `:117`), che nel `Receive` (`:217`) si
+traduce in `broadcast(new Heartbeat(), Crash.Type.Heartbeat)`. Passare per un
+self-message invece di inviare direttamente dallo scheduler tiene tutti gli
+invii dentro il thread dell'attore.
 
-Le quattro voci [B] della roadmap hanno una caratteristica in comune: sono
-**funzioni pure** dei dati del protocollo (insieme dei membri, payload della
-`Election`, `UpdateHistory`). Isolarle in `it.unitn.ds.election` come classi
-`final` con solo metodi `static` e costruttore privato dà tre vantaggi:
+**`HeartbeatTimeout`** — `resetHeartbeatTimeout` (`:281`) arma un one-shot a
+`3 × coordinatorBeatInterval` (3 s con i default). È **riarmato da tre eventi**:
+`Heartbeat`, `UpdateMsg`, `WriteOk` — qualsiasi prova di vita del coordinatore
+vale. Alla scadenza (`:302`) → `startElection(coordinatorId)`.
+Il fattore 3 è largamente sopra il RTT massimo (`maxLatency = 20 ms`), quindi
+rispetta il requisito *"Crash detection is assumed to be accurate and does not
+produce false positives"*.
 
-1. sono testabili **senza `ActorSystem`**, quindi i test girano in
-   millisecondi e sono deterministici (nessuna latenza random di mezzo);
-2. l'integrazione `[A+B]` diventa un lavoro di *cablaggio*: dentro `Replica`
-   servirà solo decidere *quando* chiamarle, non *cosa* calcolano;
-3. le invarianti di safety (chi vince, cosa va replayato) restano in un punto
-   solo e sono verificabili a colpo d'occhio in fase di discussione.
+**`ForwardTimeout`** — armato in `scheduleForwardTimeout` (`:828`) a
+`3 × coordinatorBeatInterval` quando una replica inoltra una write. Copre il
+caso della traccia *"a replica that forwards a write request to the
+coordinator starts a timeout and detects a failure if the coordinator does not
+initiate the broadcast protocol in time"*. È **chiavato per `reqId`** e non per
+`(index, value)`: due richieste diverse possono scrivere lo stesso valore
+nello stesso indice (retry del client), quindi la coppia non sarebbe una
+chiave sicura. Alla scadenza → elezione.
 
-Nessuna classe del package tiene stato: non c'è nulla di mutabile condiviso
-fra attori, come richiesto dalla traccia §2.
+**`UpdateTimeout`** — armato in `scheduleUpdateTimeout` (`:838`) subito dopo
+l'invio dell'`UpdateAck`, cancellato dal `WriteOk` corrispondente. Copre
+*"A replica detects that the coordinator has crashed if it does not receive a
+WRITEOK message within a predefined timeout after receiving an UPDATE"*. Alla
+scadenza → elezione.
 
-### `RingTopology` — topologia del ring
+Entrambi gli scheduler helper (`:828`, `:838`) **cancellano il timer precedente
+prima di riarmare**: riassegnare la variabile senza cancellare lascerebbe il
+vecchio timer vivo e produrrebbe timeout spuri.
 
-Traccia §1 "Coordinator election": *"The logical ring is defined by ordering
-replicas according to their identifiers"*.
+---
+
+## 10. Crashed mode e istrumentazione dei crash
+
+**Modalità crashed** — `triggerCrash()` (`:176`) cancella *tutti* i timer
+(`cancelAllTimers`, `:803`) e fa `become(crashed())`. Il behavior `crashed()`
+(`:181`) è un `matchAny` che scarta silenziosamente qualunque messaggio, con
+commento esplicito sul fatto che **non** si chiama `getContext().stop()`, come
+impone la traccia §2. Cancellare i timer è ciò che realizza il *"stops sending
+messages to other actors"*: senza questo, una replica "morta" continuerebbe a
+emettere heartbeat o a far scattare elezioni.
+
+**`Crash.Type.Now`** — `crash(...)` (`:162`) crasha immediatamente, **ignorando
+`after_n_messages_of_type`**: per `Now` non esiste un tipo di messaggio da
+contare, e trattare un `n > 0` come una condizione differita significherebbe
+armare un contatore che nessuno incrementa mai, lasciando viva una replica che
+il chiamante crede morta.
+
+**Crash differiti** — gli altri quattro tipi sono memorizzati in
+`pendingCrash` e valutati da `checkCrashCondition(type)` (`:870`), che
+implementa la semantica *"processa N messaggi di quel tipo, poi crasha"*:
 
 ```java
-static List<Integer>     order(Collection<Integer> memberIds);
-static Optional<Integer> successor(int self, Collection<Integer> memberIds, Set<Integer> suspected);
+if (pendingCrash != null && pendingCrash.type == type) {
+    int currentCount = messageCounters.getOrDefault(type, 0);
+    if (currentCount >= pendingCrash.after_n_messages_of_type) { triggerCrash(); return false; }
+    messageCounters.put(type, currentCount + 1);
+}
+return true;
 ```
 
-- **`order`** costruisce il ring canonico passando da un `TreeSet`: ordina in
-  senso crescente **e** deduplica in un colpo solo, così che chiamarla con
-  `group.keySet()` o con una lista arbitraria di id produca esattamente lo
-  stesso risultato. Ritorna una lista `unmodifiable` costruita su una copia,
-  quindi modificare la collezione sorgente dopo la chiamata non altera il ring
-  già calcolato.
-- **`successor`** è il cuore della tolleranza ai guasti durante l'elezione
-  (traccia §1: *"the sender assumes that the next replica in the ring has
-  crashed, skips it, and forwards the message to the following replica"*).
-  L'implementazione non usa aritmetica modulare su indici — sarebbe fragile
-  con id non contigui — ma costruisce la **sequenza di hop**: prima tutti gli
-  id maggiori di `self` in ordine crescente, poi (wrap-around) tutti quelli
-  minori. Il primo che non è in `suspected` è il successore.
+Con `after_n = 2`: il primo e il secondo messaggio vengono processati
+(contatore 0→1→2), al terzo `2 >= 2` e la replica crasha **senza** processarlo.
+Con `after_n = 0` crasha sul primo.
 
-  Conseguenze volute di questa formulazione:
-  - `self` è escluso per costruzione → **una replica non è mai successore di
-    sé stessa**, e se tutti gli altri sono sospettati si ottiene
-    `Optional.empty()` invece di un loop su sé stessi;
-  - `self` **non deve necessariamente appartenere** a `memberIds`: la
-    partenza è il suo punto di inserimento. Utile se la vista locale ha già
-    rimosso qualcuno;
-  - salta **N sospettati consecutivi**, non uno solo (serve al corner case 3
-    dello Sprint 4: due nodi consecutivi che crashano durante l'elezione);
-  - lo skip funziona anche **attraverso il wrap-around**.
+**I due lati del contatore.** La condizione è valutata in due posti diversi, e
+questo è ciò che copre tutti i punti di crash chiesti dalla traccia §2
+(*"during the broadcast of an UPDATE, after receiving an UPDATE, during the
+dissemination of WRITEOK messages, or while the coordinator election is in
+progress"*):
 
-  `suspected` è un semplice `Set<Integer>` passato dal chiamante: il ring
-  resta senza stato e chi possiede il set (la `Replica`, decisione D5) può
-  farlo crescere come preferisce.
-
-### `ElectionLogic` — payload e scelta del vincitore
+- **in ricezione**, all'inizio degli handler di `UpdateMsg` (`:404`),
+  `WriteOk` (`:436`), `Heartbeat` (`:294`) ed `Election` (`:530`);
+- **in invio**, dentro `broadcast(msg, crashPoint)` (`:785`), che valuta la
+  condizione **una volta per destinatario**:
 
 ```java
-static final UpdateID NONE = new UpdateID(0, 0);
-static int                    winner(Map<Integer, UpdateID> latestPerReplica);
-static UpdateID               latestOf(UpdateHistory history);
-static Map<Integer, UpdateID> withEntry(Map<Integer, UpdateID> latestPerReplica, int replicaId, UpdateID latest);
-static int                    newEpoch(Map<Integer, UpdateID> latestPerReplica);
+private void broadcast(Serializable msg, AbstractReplica.Crash.Type crashPoint) {
+    for (int replicaId : RingTopology.order(group.keySet())) {
+        if (!checkCrashCondition(crashPoint)) {
+            log("crashed while broadcasting " + msg + ": the remaining replicas will not receive it");
+            return;
+        }
+        tell(msg, group.get(replicaId));
+    }
+}
 ```
 
-- **`winner`** implementa alla lettera la regola della traccia: *"the replica
-  that knows the most recent update; replica identifiers are used to break
-  ties"*. Massimo secondo l'ordine naturale di `UpdateID` (lessicografico su
-  `<epoch, sequence>`, quindi un epoch più alto batte qualunque sequence), e a
-  parità di `UpdateID` vince l'**id più alto**. È una funzione pura del solo
-  payload: ogni replica che vede il giro completo del ring calcola lo stesso
-  vincitore senza round aggiuntivi. Payload vuoto → `IllegalArgumentException`
-  (situazione impossibile: chi avvia l'elezione ci mette almeno sé stesso).
-- **`latestOf`** è il ponte con la history: `latestId()` oppure `NONE` se la
-  replica non ha ancora deliverato niente. Rende impossibile mettere un
+Il contatore è **uno solo** e non c'è ambiguità, perché per un dato tipo una
+replica o è quella che lo broadcasta (il coordinatore) o è una delle
+destinatarie, mai entrambe. Quindi:
+
+| Comando | Sul coordinatore | Su una non-coordinatrice |
+|---------|------------------|--------------------------|
+| `Crash(Update, n)` | muore dopo aver inviato l'UPDATE a `n` repliche | muore dopo aver processato `n` UPDATE |
+| `Crash(WriteOK, n)` | muore dopo aver inviato il WRITEOK a `n` repliche | muore dopo `n` WRITEOK |
+| `Crash(Heartbeat, n)` | muore dopo `n` heartbeat inviati | muore dopo `n` heartbeat ricevuti |
+| `Crash(Election, n)` | — | muore dopo `n` messaggi ELECTION processati |
+| `Crash(Now, 0)` | muore subito | muore subito |
+
+**È questa la parte che rende dimostrabile la "partial dissemination"**: con
+`Crash(WriteOK, 2)` il coordinatore consegna il WRITEOK a due repliche soltanto
+e muore, ed è esattamente lo scenario della Demo 4 (§16).
+
+Due dettagli deliberati:
+
+- il ciclo scorre le repliche in **ordine crescente di id**
+  (`RingTopology.order`) e non sui `values()` della `HashMap`: così l'insieme
+  delle repliche servite prima del crash è riproducibile fra un'esecuzione e
+  l'altra, che è quello che serve a una demo;
+- la `Synchronization` **non** passa da `broadcast` (è un ciclo a parte in
+  `becomeWinner`, perché deve escludere il vincitore): il crash "durante
+  l'elezione" resta quello sul messaggio `Election`, che è il punto citato
+  dalla traccia.
+
+---
+
+## 11. Elezione del coordinatore
+
+### Logica pura, isolata dagli attori — package `election/`
+
+Tre classi `final` con soli metodi `static`, senza stato: testabili senza
+`ActorSystem`, deterministiche, e riutilizzabili come "seam" fra la FSM e i
+dati del protocollo.
+
+**`RingTopology`**
+- `order(memberIds)` → lista crescente `unmodifiable`, costruita passando da un
+  `TreeSet` (ordina *e* deduplica in un colpo solo, così `group.keySet()` e una
+  lista arbitraria producono lo stesso ring).
+- `successor(self, memberIds, suspected)` → primo id non sospettato nella
+  sequenza di hop. **Non usa aritmetica modulare su indici** (fragile con id
+  non contigui) ma costruisce esplicitamente la sequenza: prima gli id maggiori
+  di `self` in ordine, poi quelli minori (wrap-around). Conseguenze volute:
+  `self` è escluso per costruzione (una replica non è mai successore di sé
+  stessa), si saltano **N sospettati consecutivi** e non uno solo, lo skip
+  funziona anche attraverso il wrap-around, e se tutti gli altri sono
+  sospettati si ottiene `Optional.empty()` invece di un loop su sé stessi.
+
+**`ElectionLogic`**
+- `NONE = <0,0>` — sentinella per history vuota (decisione D2), strettamente
+  minore di qualunque id reale (il primo update di un epoch è `<e,1>`).
+- `winner(latestPerReplica)` — massimo `UpdateID`, tie-break sull'**id più
+  alto**. Funzione pura del solo payload: ogni replica che vede il giro
+  completo calcola lo stesso vincitore, senza round aggiuntivi.
+- `latestOf(history)` — `latestId()` oppure `NONE`; rende impossibile mettere
   `null` nel payload.
-- **`withEntry`** produce il payload da forwardare: copia + entry propria, con
-  `putIfAbsent`. La scelta *"first writer wins"* traduce il *"if it is not
-  already participating in the election, it adds its own information"* della
-  traccia: se rivedo il mio id, il messaggio ha completato il giro e il
-  payload deve restare **identico** a quello visto da tutti gli altri,
-  altrimenti repliche diverse potrebbero decidere vincitori diversi. Ritorna
-  una mappa `unmodifiable` e **non muta** l'input (il messaggio `Election` che
-  ho ricevuto resta immutabile, traccia §2).
-- **`newEpoch`** calcola `max(epoch visti) + 1`. Il massimo è preso su **tutto
-  il payload**, non solo sulla history del vincitore: se una replica ha visto
-  un epoch più alto (perché era rimasta indietro un'elezione ma aveva ricevuto
-  un update di un epoch successivo), riusare un epoch già speso romperebbe
-  l'unicità degli `UpdateID`. Con history tutte vuote dà `1`, coerente col
-  fatto che il coordinatore iniziale lavora in epoch `0`.
+- `withEntry(map, id, latest)` — copia + `putIfAbsent`. Il "first writer wins"
+  traduce alla lettera *"if it is not already participating in the election, it
+  adds its own information"*: se rivedo il mio id il messaggio ha completato il
+  giro e il payload deve restare **identico** a quello visto dagli altri,
+  altrimenti repliche diverse potrebbero eleggere vincitori diversi.
+- `newEpoch(latestPerReplica)` = `max(epoch visti) + 1` (decisione D3). Il
+  massimo è preso su **tutto il payload** e non solo sulla history del
+  vincitore: se una replica ha visto un epoch più alto, riusare un epoch già
+  speso romperebbe l'unicità degli `UpdateID`.
 
-### `SyncPlan` — diff della sincronizzazione
+**`SyncPlan`** — vedi §12.
 
-```java
-static List<Update> missingFor(UpdateHistory winnerHistory, UpdateID recipientLatest);
-static List<Update> missingForAll(UpdateHistory winnerHistory, Map<Integer, UpdateID> latestPerReplica);
-static UpdateID     oldest(Map<Integer, UpdateID> latestPerReplica);
+### La FSM dentro `Replica`
+
+Due behavior, entrambi costruiti su `createBaseReceiveBuilder()`:
+
+| Behavior | Costruito in | Accetta |
+|----------|--------------|---------|
+| NORMAL | `createReceive()` `:209` | tutto il protocollo, **inclusi** `Election`/`ElectionAck`/`Synchronization` — una replica che non ha ancora rilevato il crash può essere trascinata in un round o apprenderne l'esito restando in NORMAL |
+| ELECTION | `election()` `:245` | `ClientRead`, `ClientWrite` (bufferizzata), i quattro messaggi di elezione, `Synchronization`, `Crash`; **tutto il resto è scartato** con un `debug(...)` |
+| CRASHED | `crashed()` `:181` | niente |
+
+Scartare `UpdateMsg`/`WriteOk`/`Heartbeat` durante ELECTION è la traduzione
+dell'Hint 1 della guida interna: **congela il "latest known update" di ogni
+candidato per tutta la durata del round**, così il payload dell'`Election` non
+può diventare inconsistente mentre gira.
+
+### Stato di elezione mantenuto (`Replica.java:100-117`)
+
+| Campo | Ruolo |
+|-------|-------|
+| `Set<Integer> suspected` | repliche note come morte: il coordinatore crashato più ogni successore che non ha ack-ato. Cresce soltanto (le repliche non si riprendono). |
+| `boolean participating` | vero mentre siamo nel behavior ELECTION |
+| `boolean electionStartedFired` | garantisce **al massimo una** `callbackOnElectionStarted` per elezione, anche se il round viene riavviato dal `GlobalElectionTimeout` |
+| `Election lastForwardedElection` | ultimo payload inoltrato, da rigiocare quando si salta un successore |
+
+### Avvio — `startElection` (`:485`)
+
+1. guardia di idempotenza (`participating`);
+2. `suspected.add(crashedCoordinatorId)`;
+3. **cancella l'`HeartbeatTimeout`**: mentre siamo candidati non dobbiamo
+   sospettare nessun altro per assenza di heartbeat;
+4. `become(election())`, `fireElectionStartedOnce(...)`, arma il
+   `GlobalElectionTimeout`;
+5. costruisce il payload con la sola entry propria e lo inoltra al successore.
+
+### Circolazione — `onElection` (`:528`)
+
+1. `checkCrashCondition(Election)` — punto di crash "durante l'elezione";
+2. **ack immediato al mittente** (`:534`), prima di qualunque altra logica: chi
+   ha inoltrato deve poter cancellare il proprio `ElectionAckTimeout` al più
+   presto;
+3. `isStaleElection` (`:583`) — scarta un `Election` ritardatario di un round
+   già deciso, cioè uno che eleggerebbe il coordinatore che stiamo già
+   seguendo; se siamo noi il coordinatore rispondiamo con una
+   `Synchronization` mirata, così il mittente rimasto indietro può uscire dal
+   round invece di restarci bloccato;
+4. se non stiamo già partecipando → entriamo in ELECTION (stesso setup di
+   `startElection`, con `callbackOnElectionStarted(coordinatorId)`: il
+   coordinatore in cui credevamo è quello crashato);
+5. **se il payload contiene già il nostro id** → il giro è completo, il payload
+   è definitivo: calcoliamo `winner(...)`. Se siamo noi → `becomeWinner`;
+   altrimenti inoltriamo così com'è, perché il messaggio deve **raggiungere il
+   vincitore**, unico autorizzato ad annunciare l'esito;
+6. altrimenti → inoltriamo `withEntry(payload, id, latestOf(history))`.
+
+### Skip del successore silenzioso
+
+`rearmElectionAckTimeout` (`:624`) arma `ElectionAckTimeout(successorId)` a
+`getMaxLatencyPlusTolerance()`. `onElectionAck` (`:591`) lo cancella.
+`onElectionAckTimeout` (`:596`) aggiunge il successore a `suspected`, logga e
+**rigioca `lastForwardedElection`** verso il successore successivo — che
+`RingTopology.successor` calcola già saltando tutti i sospettati. Traccia §1:
+*"the sender assumes that the next replica in the ring has crashed, skips it,
+and forwards the message to the following replica"*.
+
+Se `successor` restituisce `Optional.empty()` (siamo gli unici vivi),
+`forwardElection` (`:514`) vince per default.
+
+### Anti-livelock
+
+`rearmGlobalElectionTimeout` (`:629`) arma un one-shot a
+`N × getMaxLatencyPlusTolerance() × 2` — abbastanza per un giro completo del
+ring. Alla scadenza (`:613`) il round riparte da zero **senza rifare la
+callback** (`electionStartedFired` resta `true`): è ancora la stessa
+partecipazione, solo un altro tentativo. È la rete di sicurezza per il caso in
+cui il vincitore crashi prima di annunciarsi (corner case 4 dello Sprint 4):
+al riavvio, il primo tentativo di inoltro verso il vincitore morto scade
+sull'`ElectionAckTimeout`, che lo aggiunge a `suspected`, e il round prosegue
+senza di lui.
+
+---
+
+## 12. Sincronizzazione e update orfani
+
+### `SyncPlan` — il diff
+
+- `missingFor(winnerHistory, recipientLatest)` — wrapper su
+  `UpdateHistory.after(...)`, tenuto come seam esplicito perché il livello di
+  elezione non tocchi mai gli interni della history. Totale anche nei casi
+  degeneri (destinatario più avanti del vincitore → lista vuota).
+- `oldest(latestPerReplica)` — minimo dei `latestId` del payload.
+- `missingForAll(winnerHistory, latestPerReplica)` = `missingFor(history, oldest(...))`.
+
+Il motivo di `missingForAll` è strutturale: `Synchronization` è un **broadcast
+unico** con una sola lista, quindi il vincitore non può spedire una lista
+personalizzata per destinatario. La lista giusta è allora il diff rispetto
+alla **replica più indietro** fra i partecipanti; chi ha già applicato una
+parte di quegli update li scarta, perché la consegna è **idempotente
+sull'`UpdateID`** (property Integrity: *"a process delivers m at most once"*).
+
+### `becomeWinner` (`:647`) — l'ordine delle fasi è la parte critica
+
+```
+1. cancella ElectionAckTimeout e GlobalElectionTimeout, azzera lo stato di elezione
+2. newEpoch = ElectionLogic.newEpoch(payload)
+3. completeInterruptedUpdates()          ← PRIMA di aprire il nuovo epoch
+4. coordinatorId = id;  lastAssignedId = <newEpoch, 0>;  azzera ackCounts/committed
+5. missing = SyncPlan.missingForAll(history, payload)   ← include ciò che ha appena applicato
+6. Synchronization(id, newEpoch, missing) a tutti tranne sé stesso
+7. become(createReceive()); startHeartbeatLoop()
+8. callbackOnCoordinatorElected(id)
+9. replayPendingClientWrites()
 ```
 
-È la metà "safety-critical" dello sprint: serve a garantire la property della
-traccia §1 (*"if a replica a applies an update w, then all correct replicas
-will eventually apply w"*).
+Il punto 3 **deve** precedere il 5: gli update interrotti dell'epoch morto
+vengono prima deliverati localmente e finiscono quindi dentro la
+`Synchronization`. È esattamente ciò che la traccia §1 "Properties" chiede:
+*"a newly elected coordinator must detect and complete any update broadcasts
+that were interrupted by the previous coordinator's failure"*.
 
-- **`missingFor`** è il seam previsto dal contratto sopra
-  `UpdateHistory.after(...)`: il livello di elezione non tocca mai gli
-  interni della history. Rimane totale anche nei casi degeneri (destinatario
-  più avanti del vincitore → lista vuota, mai un risultato "negativo").
-- **`missingForAll` + `oldest`** sono un'aggiunta rispetto agli stub di Fase 0
-  (§6.2 del contratto), **additiva** e quindi non rompe nulla per A. Motivo:
-  `Synchronization` come congelata in §2 del contratto è un **broadcast unico**
-  con una sola `List<Update> pendingUpdates`, quindi il vincitore non può
-  spedire una lista personalizzata per destinatario. La lista da mettere nel
-  broadcast è allora il diff calcolato rispetto alla **replica più indietro**,
-  cioè il minimo dei `latestId` presenti nel payload della `Election`
-  (`oldest`). Chi ha già applicato una parte di quegli update semplicemente li
-  scarta: la consegna è idempotente sull'`UpdateID` (property "Integrity": una
-  sola delivery per messaggio) — **nota per l'integrazione [A+B]: il
-  destinatario della `Synchronization` deve filtrare gli `Update` con
-  `id <= proprio latestId` prima di applicarli**, altrimenti
-  `callbackOnUpdateApplied` verrebbe chiamata due volte per la stessa write.
+`completeInterruptedUpdates` (`:690`) itera i `pendingUpdates` **ordinati per
+`UpdateID`** (`Collections.sort` sulle chiavi) — l'ordine totale va preservato
+anche in recovery — salta quelli già deliverati e applica gli altri.
 
-### Decisioni di Fase 0 seguite
+### `onSynchronization` (`:707`) — lato ricevente
 
-Nel codice ho seguito le raccomandazioni già scritte in `CONTRACT_PHASE0.md`
-§7; segnalo quali toccano il mio pezzo, da confermare insieme prima del merge:
+Prima di tutto una **guardia di idempotenza**: se non stiamo partecipando a
+un'elezione e l'annuncio riguarda il coordinatore e l'epoch che abbiamo già
+adottato, il messaggio è un duplicato e viene ignorato. Serve davvero: il nuovo
+coordinatore risponde con una `Synchronization` a **ogni** `Election`
+ritardataria che gli arriva (vedi `isStaleElection`), quindi la stessa replica
+può ricevere lo stesso annuncio tre o quattro volte. Rieseguire l'handler
+rigiocherebbe le write bufferizzate una seconda volta, trasformando **una**
+richiesta del client in **due** update distinti.
 
-| Decisione | Scelta adottata nel codice [B] | Note |
-|-----------|--------------------------------|------|
-| **D1** — correlazione `ElectionAck` | ack vuoto, come da raccomandazione | non impatta il package `election/` (nessuna delle tre classi lo tocca); si rivaluta in `[A+B]` se emergono ack stantii |
-| **D2** — sentinella history vuota | `ElectionLogic.NONE = <0,0>` | congelata; c'è un test che verifica `NONE < <0,1>`, cioè che sia più piccola di qualunque id reale |
-| **D3** — calcolo di `newEpoch` | `max(epoch visti) + 1` via `ElectionLogic.newEpoch` | vedi sopra sul perché il massimo è su tutto il payload |
-| **D4** — write durante `ELECTION` | non impatta [B] | resta ad A / integrazione |
-| **D5** — sorgente del set `suspected` | `RingTopology` lo riceve come parametro, non lo possiede | la `Replica` (A) resta l'unica proprietaria del set |
+Superata la guardia: cancella i timer di elezione, azzera lo stato, adotta il
+nuovo `coordinatorId`, poi
 
-### Test
+- **replay filtrato**: `if (!alreadyDelivered(u.id)) applyUpdate(u)` — il
+  filtro di idempotenza è ciò che impedisce una seconda
+  `callbackOnUpdateApplied` per la stessa write;
+- scarta tutto ciò che resta dell'epoch morto (`pendingUpdates`, `ackCounts`,
+  `committed`, `updateTimeouts`): da qui in poi la sola sorgente di verità è
+  il nuovo coordinatore;
+- `lastAssignedId = <newEpoch, 0>`;
+- torna in NORMAL, riarma l'`HeartbeatTimeout`, chiama
+  `callbackOnCoordinatorElected` e rigioca le write bufferizzate.
 
-Package `src/test/java/it/unitn/ds/election/`, JUnit 5, nessun `ActorSystem`.
-**60 test, tutti verdi** (22 + 22 + 16).
+`alreadyDelivered(uid)` (`:473`) confronta con `history.latestId()`: la history
+è ordinata, quindi "id ≤ ultimo" significa "già visto".
+
+### Write che sopravvivono all'elezione
+
+Il client emette ogni richiesta **una sola volta** e non ritenta: una write il
+cui coordinatore muore a metà andrebbe persa per sempre. Perciò:
+- `clientWrites` (`:90`, `LinkedHashMap` per preservare l'ordine FIFO del
+  client) trattiene ogni write per cui questa replica è stata contattata e non
+  ha ancora risposto;
+- durante ELECTION le nuove write sono **parcheggiate**, non scartate
+  (`onClientWriteDuringElection`, `:354`) — decisione D4;
+- `replayPendingClientWrites` (`:375`) le rimanda al nuovo coordinatore appena
+  l'elezione si chiude, sia sul vincitore sia su chi riceve la
+  `Synchronization`;
+- l'entry è rimossa solo in `applyUpdate`, quando il client riceve davvero il
+  suo `WriteReply`.
+
+---
+
+## 13. Come sono garantite le proprietà di safety
+
+Le quattro proprietà del riquadro "Background: total order broadcast" della
+traccia:
+
+**Validity** — *se il mittente è corretto, prima o poi consegna m*. Una write
+di un client corretto raggiunge il coordinatore; se il coordinatore muore
+prima del commit, `ForwardTimeout`/`UpdateTimeout`/`HeartbeatTimeout`
+producono un'elezione e `replayPendingClientWrites` rimette la richiesta in
+circolo verso il nuovo coordinatore.
+
+**Integrity** — *consegna al più una volta*. Tre filtri indipendenti:
+`pendingUpdates.remove` in `applyUpdate` (fase 2 normale), il check
+`alreadyDelivered` nel replay della `Synchronization`, e lo stesso check in
+`completeInterruptedUpdates`. `callbackOnUpdateApplied` è invocata esattamente
+in un punto del codice (`:461`), dentro `applyUpdate`. Sul versante della
+richiesta del client, la guardia sui duplicati di `onSynchronization` impedisce
+che una sola write venga rigiocata due volte verso il nuovo coordinatore.
+
+**Uniform Agreement** — *se una replica consegna m, tutte le repliche corrette
+consegnano m*. È il caso critico "coordinatore morto dopo aver mandato WRITEOK
+solo ad alcuni", quello che la Demo 4 riproduce. Chi ha applicato l'update ha
+`latestId ≥ <e,i>`; il vincitore dell'elezione è per costruzione la replica con
+il `latestId` massimo, quindi **ha necessariamente quell'update in history**
+(assunzione della traccia: un quorum resta sempre vivo, e almeno una replica
+corretta conosce l'update più recente). `missingForAll` lo include nel
+broadcast, e ogni replica indietro lo applica. Il ramo simmetrico — il
+coordinatore muore dopo aver ricevuto il quorum di ack ma prima di mandare
+WRITEOK — è coperto da `completeInterruptedUpdates`, che delivera le proposte
+di fase 1 rimaste in sospeso sul vincitore.
+
+**Total Order** — gli `UpdateID` sono assegnati da un solo coordinatore per
+epoch (`lastAssignedId.nextInEpoch()`), gli epoch sono strettamente crescenti
+(`newEpoch = max(visti)+1`), la history è append-only e il replay è ordinato
+(`after()` preserva l'ordine, `completeInterruptedUpdates` ordina le chiavi).
+Nessuna replica può quindi applicare `w'` prima di `w` se `id(w) < id(w')`.
+
+---
+
+## 14. Tabella riassuntiva dei timer
+
+| Timer | Valore | Armato in | Cancellato da |
+|-------|--------|-----------|---------------|
+| heartbeat del coordinatore | `coordinatorBeatInterval` (1000 ms), periodico | `startHeartbeatLoop` `:262` | `cancelAllTimers`, `rearmHeartbeatTimeout` |
+| `HeartbeatTimeout` | `3 × 1000 = 3000 ms` | `resetHeartbeatTimeout` `:281` | ogni `Heartbeat`/`UpdateMsg`/`WriteOk`; ingresso in ELECTION |
+| `ForwardTimeout` | `3 × 1000 = 3000 ms` | `scheduleForwardTimeout` `:828` | arrivo dell'`UpdateMsg` con quel `reqId` |
+| `UpdateTimeout` | `3 × 1000 = 3000 ms` | `scheduleUpdateTimeout` `:838` | `WriteOk` con quell'id; `Synchronization` |
+| `ElectionAckTimeout` | `getMaxLatencyPlusTolerance()` = `20 + 10·N` ms | `rearmElectionAckTimeout` `:624` | `ElectionAck` |
+| `GlobalElectionTimeout` | `N × getMaxLatencyPlusTolerance() × 2` | `rearmGlobalElectionTimeout` `:629` | `becomeWinner`, `onSynchronization` |
+
+Con `N = 7`: ack-timeout ≈ 90 ms, global ≈ 1,26 s, detection ≈ 3 s.
+Il budget dei test (`TestsCommons.getElectionMaxDelay`) è
+`(3000 + 2·max_lat·N + 2·N·max_lat) × 5` ≈ 17 s per N=7: ampio margine.
+
+---
+
+## 15. Logging
+
+Tutto passa da `Logger` (timestamp a precisione ms). **Non c'è un solo
+`System.out.println` nel progetto**, nemmeno in `Main`: la traccia avverte che
+le stampe possono interferire con i test automatici.
+
+Formati prescritti dalla traccia §2 e dove sono prodotti:
+
+| Formato richiesto | Dove |
+|-------------------|------|
+| `[Client X] requesting READ (<idx>) to <ReplicaID>` | `Client.java:51` |
+| `[Client X] requesting WRITE (<idx>, <val>) to <ReplicaID>` | `Client.java:60` |
+| `[Client X] READ complete (...)` / `WRITE complete (...)` | `AbstractClient` (codebase) |
+| `[Client X] TIMEOUT READ/WRITE request to ...` | `AbstractClient` (codebase) |
+| `[Replica id] applied update <epoch>:<seq> (<idx>, <val>)` | `Replica.java:459` |
+| `[Replica id] CRASHED` | `AbstractReplica:372` (codebase) |
+
+In più, log nostri sui passaggi chiave del protocollo: `UPDATE proposed`,
+`ACK <id> to coordinator`, `quorum reached for <id> -> WRITEOK`,
+`crashed while broadcasting ...`, `HEARTBEAT TIMEOUT`,
+`ELECTION ACK TIMEOUT: suspecting k`, `ring lap complete, winner is k`,
+`WON the election`, `SYNCHRONIZATION from k: epoch e, n update(s) to replay`,
+`replaying n buffered write(s)`.
+
+Il commento degli scenari di demo esce con il prefisso `[demo]`, così si
+distingue a colpo d'occhio dai log degli attori.
+
+---
+
+## 16. Demo eseguibili
+
+`Main.java` contiene i quattro scenari raccomandati dalla traccia §4
+(*"three or four representative execution examples, including corner cases"*).
+Ogni demo costruisce il proprio `ActorSystem`, lo guida dall'esterno con
+richieste del client e comandi di crash, e lo termina prima che parta la
+successiva: il log di uno scenario si legge da solo. `N = 5`, coordinatore
+iniziale `0`.
 
 ```bash
-./gradlew test --tests "it.unitn.ds.election.*"
+./gradlew run                 # tutti e quattro in sequenza (~30 s)
+./gradlew run --args="3"      # solo lo scenario 3
 ```
 
-Cosa coprono, oltre al caso nominale:
+### Demo 1 — happy path
+Tre write e una read da un client attaccato alla Replica 4. Si osservano gli
+id consecutivi `<0,1> <0,2> <0,3>`, i cinque ACK, il `quorum reached`, e le
+cinque repliche che applicano nello stesso ordine. La read finale legge `30`,
+cioè l'ultima write dell'ordine totale.
 
-- `RingTopologyTest` (22) — ordinamento e deduplicazione, uso diretto di
-  `group.keySet()`, immutabilità dello snapshot, successore semplice,
-  wrap-around, id non contigui, **giro completo del ring** che visita ogni
-  replica esattamente una volta, ring da un solo membro e ring vuoto, skip di
-  uno / di due sospettati consecutivi / attraverso il wrap-around, tutti
-  sospettati → `Optional.empty()`, `self` sospettato o fuori dal ring,
-  argomenti `null`.
-- `ElectionLogicTest` (22) — vincitore singolo, replica più aggiornata,
-  epoch che batte la sequence, tie-break sull'id più alto, tie-break che si
-  applica **solo** fra le repliche più aggiornate (un id alto ma indietro non
-  vince), tutte le history vuote → vince l'id più alto, indipendenza
-  dall'ordine di iterazione della mappa, payload vuoto e `null`;
-  `latestOf` su history vuota e piena; `withEntry` che aggiunge, che preserva
-  l'entry già presente, che non muta la sorgente e che ritorna
-  `unmodifiable`; `newEpoch` nei casi base e nel caso in cui un partecipante
-  ha visto un epoch più alto del vincitore.
-- `SyncPlanTest` (16) — catch-up completo da history vuota, catch-up
-  parziale, replica allineata, replica più avanti del vincitore, ordine
-  totale preservato nel diff, diff che attraversa il **confine di epoch**
-  (update orfano dell'epoch precedente), history del vincitore vuota,
-  immutabilità del risultato, `oldest` come minimo del payload (con confronto
-  epoch-prima-di-sequence), broadcast che copre la replica più indietro,
-  broadcast vuoto quando sono tutti allineati, payload vuoto e `null`.
+### Demo 2 — crash di una replica non coordinatrice
+Dopo una prima write, la Replica 3 riceve `Crash(Now, 0)`. La write successiva
+raggiunge comunque il quorum (4 repliche vive su 5, ne bastano 3) e viene
+applicata dalle sole repliche vive. Il secondo client, che continua a parlare
+con la replica morta, va in `TIMEOUT READ` dopo 800 ms.
 
-Nessuna regressione: `./gradlew test --tests "*NoCrashes*"` resta verde (4/4);
-`WithCrashes` e i casi `APICompliance` su crash/elezione restano rossi come
-atteso finché Sprint 2 e l'integrazione `[A+B]` non sono chiusi.
+### Demo 3 — crash del coordinatore, elezione e sincronizzazione
+Il coordinatore 0 muore fra due write. La write emessa subito dopo resta
+bloccata sulla Replica 2, che l'aveva inoltrata. Dopo ~3 s scattano gli
+`HEARTBEAT TIMEOUT`, parte l'elezione ad anello, tutte le repliche hanno lo
+stesso `latestId` e il tie-break assegna la vittoria alla Replica 4; la
+`SYNCHRONIZATION` apre l'epoch 1 e la Replica 2 rigioca la write bufferizzata,
+che viene applicata come `<1,1>`. Il client riceve il suo `WRITE complete`
+diversi secondi dopo averla emessa, senza aver ritentato nulla.
 
-### Cosa manca dello Sprint 3 (tutto `[A+B]`, da fare in pair)
+### Demo 4 — WRITEOK parzialmente disseminato (uniform agreement)
+Il coordinatore è armato con `Crash(WriteOK, 2)`: raggiunge il quorum, invia il
+WRITEOK a due repliche (sé stesso — che però è già morto quando gli tornerebbe
+indietro — e la Replica 1) e muore a metà broadcast, lasciando il log
+`crashed while broadcasting WriteOk(<0,1>)`. Da quel momento **una sola replica
+al mondo ha applicato `<0,1>`**. L'elezione la premia proprio per questo
+(`winner is 1`), e la sua `SYNCHRONIZATION` porta l'update alle altre tre, che
+lo applicano. Il client, che era attaccato alla Replica 4, riceve il suo
+`WRITE complete` e la read finale legge `99` da una replica che quel valore
+l'ha conosciuto solo attraverso la sincronizzazione.
 
-Il package `election/` è completo per la parte statica; resta il cablaggio
-dentro `Replica.java`, che per contratto è di A fino al merge:
+È lo scenario che dimostra dal vivo la property della traccia: *"if a replica a
+applies an update w, then all correct replicas will eventually apply w"*.
 
-1. behavior `election()` separato (`become`) con i soli `Election`,
-   `ElectionAck`, `ElectionAckTimeout`, `GlobalElectionTimeout`,
-   `Synchronization`, `Crash`;
-2. trigger dell'elezione dall'`HeartbeatTimeout` / `UpdateTimeout` /
-   `ForwardTimeout` dello Sprint 2 (oggi logging-only);
-3. `ElectionAckTimeout` → aggiunta del successore silenzioso a `suspected` e
-   nuova chiamata a `RingTopology.successor(...)`;
-4. broadcast della `Synchronization` con `SyncPlan.missingForAll(...)` e
-   `ElectionLogic.newEpoch(...)`, **dopo** aver completato gli update
-   pendenti e prima di riprendere le write;
-5. filtro di idempotenza sugli `Update` replayati (vedi nota in `SyncPlan`);
-6. `GlobalElectionTimeout` anti-livelock;
-7. firing di `callbackOnElectionStarted` / `callbackOnCoordinatorElected` con
-   il timing congelato in `CONTRACT_PHASE0.md` §8.
+---
+
+## 17. Test: cosa esiste e cosa misura
+
+**93 test, tutti verdi**, verificati su 3 esecuzioni consecutive complete
+(`./gradlew test --rerun-tasks`), senza flakiness.
+
+| Suite | Origine | Casi | Cosa verifica |
+|-------|---------|------|---------------|
+| `base/APICompliance` | codebase | 25 | conformità alle API e alle callback obbligatorie |
+| `base/NoCrashes` | codebase | 4 | happy path con N ∈ {3, 7, 22} |
+| `base/WithCrashes` | codebase | 4 | crash di più repliche e del coordinatore |
+| `election/RingTopologyTest` | nostro | 22 | ring, successore, skip, wrap-around |
+| `election/ElectionLogicTest` | nostro | 22 | vincitore, tie-break, payload, newEpoch |
+| `election/SyncPlanTest` | nostro | 16 | diff, watermark, immutabilità |
+
+**`APICompliance`** copre, oltre all'happy path: `replicasCrashNow`,
+`crashReplicaAndTryRequests` (il client va in timeout con i campi giusti),
+`callbackOnUpdateAppliedInvokedOnAllReplicas`,
+`callbackOnUpdateAppliedOncePerWrite`,
+`callbackOnElectionStartedInvokedCorrectly`,
+`callbackOnElectionStartedCalledAtMostOncePerReplica`,
+`callbackOnCoordinatorElectedAllAgree`,
+`callbackOnCoordinatorElectedNewCoordAlsoCalls`.
+
+**`WithCrashes`** copre due scenari parametrizzati:
+- `nonCoordinatorsCrashClientWritesWaitsReads` (N ∈ {7, 22}): crashano
+  `N/2 − 2` repliche non coordinatrici, la write deve comunque andare a buon
+  fine e la read successiva leggere il valore scritto;
+- `coordinatorCrashClientWritesWaitsReads` (N ∈ {7, 22}): crashano il
+  coordinatore e altre due repliche **con `Crash.Type.Now`**, poi il client
+  scrive: la write deve completare *dopo* l'elezione e il `WriteResult` deve
+  riportare la replica contattata.
+
+**I 60 unit test in `election/`** girano senza `ActorSystem`, quindi in
+millisecondi e in modo deterministico. Coprono, fra l'altro: ordinamento e
+deduplicazione del ring, giro completo che visita ogni replica esattamente una
+volta, skip di due sospettati consecutivi e attraverso il wrap-around, id non
+contigui; tie-break applicato *solo* fra le repliche più aggiornate,
+indipendenza dall'ordine di iterazione della mappa, `newEpoch` quando un
+partecipante ha visto un epoch più alto del vincitore; diff che attraversa il
+confine di epoch (update orfano), replica più avanti del vincitore,
+immutabilità dei risultati.
+
+Quello che **non** c'è è una suite end-to-end sui crash a punti specifici del
+protocollo: vedi §18.2.
+
+---
+
+## 18. Cosa manca da fare
+
+In ordine di priorità.
+
+### 18.1 Report LaTeX (Sprint 5.1) — **bloccante per la consegna**
+
+`report/main.tex` compila ma le tre sezioni sono **file di una riga con il solo
+`\section{}`**: `01_structure.tex`, `02_design.tex`, `03_implementation.tex`.
+Serve scrivere 3-4 pagine (max 6, oltre le quali il progetto viene rifiutato
+d'ufficio) in inglese, rispondendo alle domande delle slide:
+
+- scelte architetturali (perché la logica di elezione è pura e separata dalla FSM);
+- gestione dei timeout e valori scelti (§14) con la giustificazione del "no
+  false positives";
+- topologia del ring e perché la sequenza di hop invece dell'aritmetica modulare;
+- trattamento degli update orfani e ordine delle fasi in `becomeWinner`;
+- motivazione del tie-break e della sentinella `NONE`;
+- perché `Synchronization` è un broadcast unico calcolato sul watermark;
+- come è istrumentato il crash a metà broadcast (§10) e cosa dimostra la Demo 4;
+- assunzioni aggiuntive (§19).
+
+Va incluso anche il disclaimer sull'uso di assistenza AI.
+
+### 18.2 Test dei corner case dello Sprint 4
+
+I test della codebase passano tutti e l'istrumentazione per innescare ogni
+corner case **c'è** (§10), ma i sei scenari elencati in `ROADMAP.md` → Sprint 4
+non hanno un test automatico dedicato:
+
+| Corner case | Come innescarlo | Stato |
+|-------------|-----------------|-------|
+| 1. coordinatore crasha durante il broadcast di UPDATE | `Crash(Update, k)`, `k < N` | innescabile, nessun test |
+| 2. coordinatore crasha dopo WRITEOK parziale | `Crash(WriteOK, k)` | ✅ dimostrato dalla Demo 4, nessun test |
+| 3. due nodi consecutivi crashano durante l'elezione | `Crash(Now, 0)` su id adiacenti | solo unit test su `RingTopology` |
+| 4. vincitore crasha prima della `Synchronization` | `Crash(Election, k)` | logica presente, nessun test |
+| 5. replica crasha dopo l'ACK, prima del WRITEOK | `Crash(Update, 0)` | innescabile, nessun test |
+| 6. client contatta una replica crashata | `Crash(Now, 0)` | ✅ `APICompliance.crashReplicaAndTryRequests` |
+
+Conviene aggiungere una suite `src/test/java/it/unitn/ds/scenarios/` con questi
+casi: è anche il materiale migliore per rispondere alle domande dell'orale.
+
+### 18.3 Pulizia prima della consegna
+
+- Codice mai usato: `UpdateID.nextEpoch()`, `UpdateHistory.asList()`/`size()`/
+  `isEmpty()`, `SyncPlan.missingFor` (usato solo indirettamente),
+  `Election.initiatorId` (trasportato ma non usato per decidere).
+  Non è un problema, ma va saputo se qualcuno lo chiede all'orale.
+- Alcuni typo nei commenti (`aliv`, `lready`, `Puleld`, `awating`,
+  `callbackOnElectionSTarted`).
+- `CONTRACT_PHASE0.md` §9 ha ancora la checklist delle decisioni D1-D5
+  formalmente aperta, benché tutte e cinque siano di fatto chiuse nel codice.
+
+### 18.4 Consegna (Sprint 5.3)
+
+- [ ] `./gradlew test` verde su clone pulito (verificato oggi sul working tree);
+- [ ] report `.pdf` autocontenuto;
+- [ ] archivio `tar -czvf CognomeACognomeB.tgz CognomeACognomeB/` con sorgenti
+      + report, **senza** i PDF del prof in `docs/`;
+- [ ] prenotazione dello slot via mail a Picco + Pasquali + Genetti;
+- [ ] indicare in-person vs online;
+- [ ] preparare i 12 minuti (timer rigido) + Q&A.
+
+---
+
+## 19. Limitazioni note e assunzioni da dichiarare nel report
+
+Sono scelte difendibili, ma vanno **dichiarate** (traccia §2: *"It is important
+to state all additional assumptions in the report"*).
+
+1. **I messaggi già accodati sopravvivono al crash.** I `NetworkChannel` sono
+   figli della replica e non vengono fermati da `triggerCrash()`, quindi ciò
+   che il mittente aveva già consegnato al canale arriva comunque. Il crash
+   impedisce di *iniziare* nuovi invii, non di completare quelli in volo — ed è
+   proprio questo che rende il broadcast parziale di §10 un troncamento del
+   ciclo di invio e non una cancellazione di messaggi già partiti.
+2. **`ElectionAck` è vuoto (D1)**: `onElectionAck` (`:591`) cancella il timer
+   corrente senza verificare da chi arriva. Un ack in ritardo di un successore
+   già saltato può quindi cancellare un timer appena riarmato per un altro
+   successore; l'effetto peggiore è un round più lento, coperto dal
+   `GlobalElectionTimeout`. Correlare l'ack con l'id del mittente sarebbe una
+   modifica di due righe se emergesse il problema.
+3. **Una `Synchronization` molto in ritardo può interrompere un'elezione.** La
+   guardia sui duplicati non scatta quando la replica sta partecipando a un
+   round: se l'annuncio di un coordinatore ormai morto arriva in quel momento,
+   la replica esce dall'elezione e lo adotta, per poi riaccorgersi della sua
+   morte al successivo `HeartbeatTimeout`. Il sistema converge lo stesso, con
+   un'elezione in più. Non l'abbiamo blindato perché richiederebbe di rifiutare
+   annunci da repliche sospettate, e la finestra è larga quanto un hop.
+4. **Una replica viva ma lenta può essere sospettata** se non ack-a entro
+   `getMaxLatencyPlusTolerance()`. Verrebbe esclusa dal payload
+   dell'`Election` e quindi dal calcolo del watermark di `missingForAll`,
+   restando potenzialmente indietro. La traccia però assume esplicitamente che
+   la crash detection sia accurata, quindi lo scenario è fuori dal modello.
+5. **Le read durante l'elezione sono servite localmente** e possono restituire
+   un valore non ancora aggiornato: consistenza sequenziale, non
+   linearizzabilità — che è quanto la traccia richiede.
+6. **Il vincitore delivera anche update mai arrivati al quorum.**
+   `completeInterruptedUpdates` applica tutte le proposte di fase 1 rimaste
+   pendenti, comprese quelle che non avevano raggiunto `⌊N/2⌋+1` ack. Non viola
+   nessuna delle quattro proprietà (nessuno le ha "non-consegnate" in modo
+   osservabile) ed è la scelta conservativa: preferisce completare piuttosto
+   che scartare.
+7. **La membership è statica**: `suspected` cresce soltanto, coerentemente con
+   *"Replicas fail by crashing and do not recover"*.
+
+---
+
+## 20. Come compilare ed eseguire
+
+Serve solo un JDK 17+; il wrapper gestisce Gradle.
+
+```bash
+./gradlew build                                  # compila tutto ed esegue i test
+./gradlew test                                   # solo i test (~2 minuti)
+./gradlew test --tests "*NoCrashes*"             # happy path
+./gradlew test --tests "*WithCrashes*"           # crash + elezione
+./gradlew test --tests "*APICompliance*"         # conformità alle API
+./gradlew test --tests "it.unitn.ds.election.*"  # unit test puri (millisecondi)
+./gradlew test --rerun-tasks                     # forza la riesecuzione (utile per la flakiness)
+./gradlew clean
+
+./gradlew run                                    # i quattro scenari di demo (~30 s)
+./gradlew run --args="4"                         # solo lo scenario 4
+```
+
+Report HTML dei test: `build/reports/tests/test/index.html`.
+Durante i test i log sono disabilitati (`TestsCommons.DO_PRINTS = false`)
+perché, come avverte la traccia, le stampe possono interferire con l'esito;
+nelle demo invece sono attivi su stdout (`Logger.setDestinationStdout()`).
