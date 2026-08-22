@@ -25,13 +25,8 @@ src/       # Java sources (main + tests)
 
 ## Build and run
 
-A Gradle wrapper at version **9.2.1** is used. To set it up the first time:
-
-```bash
-gradle wrapper --gradle-version 9.2.1
-```
-
-Then:
+A Gradle wrapper at version **9.2.1** is committed with the sources, so a JDK
+17+ is the only prerequisite — the wrapper fetches Gradle by itself:
 
 ```bash
 ./gradlew build      # compile everything

@@ -26,21 +26,23 @@
 hs_err_pid*
 replay_pid*
 
+# Gradle build caches and outputs. The wrapper itself (gradlew, gradlew.bat,
+# gradle/wrapper/) is deliberately NOT ignored: it must be committed so that
+# "./gradlew build" works from a clean clone, and so that the submission
+# archive is self-contained.
 .gradle
 /build/
 **/.gradle
-**/gradle
 **/.idea
 **/build/
 **/bin/
-gradlew
-gradlew.bat
 
 # Ignore Gradle GUI config
 gradle-app.setting
 
 # Avoid ignoring Gradle wrapper jar file (.jar files are usually ignored)
 !gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.jar
 
 # Cache of project
 .gradletasknamecache

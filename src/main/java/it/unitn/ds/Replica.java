@@ -117,7 +117,7 @@ public class Replica extends AbstractReplica {
     private static class SendHeartbeatTick implements Serializable {
     }
 
-    /** A client write awating its WriteReply, kept so it can be replayed */
+    /** A client write awaiting its WriteReply, kept so it can be replayed */
     private static final class PendingClientWrite {
         final long reqId;
         final int index;
@@ -291,7 +291,7 @@ public class Replica extends AbstractReplica {
     }
 
     private void onHeartbeat(Heartbeat msg) {
-        if (!checkCrashCondition(AbstractReplica.Crash.Type.Heartbeat))
+        if (!checkIncomingCrashCondition(AbstractReplica.Crash.Type.Heartbeat))
             return;
 
         if (!isCoordinator()) {
@@ -401,7 +401,7 @@ public class Replica extends AbstractReplica {
     /** Every replica acks a phase-1 proposal and remembers it until WRITEOK. */
     private void onUpdateMsg(UpdateMsg msg) {
         // Crash check and timeout reset
-        if (!checkCrashCondition(AbstractReplica.Crash.Type.Update))
+        if (!checkIncomingCrashCondition(AbstractReplica.Crash.Type.Update))
             return;
         if (!isCoordinator())
             resetHeartbeatTimeout();
@@ -433,7 +433,7 @@ public class Replica extends AbstractReplica {
     /** Every replica delivers the update; the contacted one answers the client. */
     private void onWriteOk(WriteOk msg) {
         // Crash check and timeout reset
-        if (!checkCrashCondition(AbstractReplica.Crash.Type.WriteOK))
+        if (!checkIncomingCrashCondition(AbstractReplica.Crash.Type.WriteOK))
             return;
         if (!isCoordinator())
             resetHeartbeatTimeout();
@@ -502,7 +502,7 @@ public class Replica extends AbstractReplica {
         forwardElection(new Election(id, payload));
     }
 
-    /** callbackOnElectionSTarted must fire at most once per election */
+    /** callbackOnElectionStarted must fire at most once per election */
     private void fireElectionStartedOnce(int crashedCoordinatorId) {
         if (!electionStartedFired) {
             electionStartedFired = true;
@@ -519,7 +519,7 @@ public class Replica extends AbstractReplica {
             tell(msg, group.get(successor.get()));
             rearmElectionAckTimeout(successor.get());
         } else {
-            // this replica is the only one left aliv
+            // this replica is the only one left alive
             log("no alive successor left in the ring, winning by default");
             becomeWinner(msg.latestPerReplica);
         }
@@ -536,16 +536,15 @@ public class Replica extends AbstractReplica {
         if (isStaleElection(msg)) {
             debug("dropping stale election " + msg + ": " + coordinatorId + " is already our coordinator");
             if (isCoordinator()) {
-                // The sender is still stuck in a round we havea lready won:
+                // The sender is still stuck in a round we have already won:
                 // re-announce our leadership so that it can move on.
-                tell(new Synchronization(id, lastAssignedId.epoch,
-                        SyncPlan.missingForAll(history, msg.latestPerReplica)), getSender());
+                tell(new Synchronization(id, lastAssignedId.epoch, syncPayloadFor(msg)), getSender());
             }
             return;
         }
 
         if (!participating) {
-            // Puleld into a round started by somebody else
+            // Pulled into a round started by somebody else
             participating = true;
             suspected.add(coordinatorId);
             cancelTimeout(heartbeatTimeoutTask);
@@ -576,15 +575,48 @@ public class Replica extends AbstractReplica {
     }
 
     /**
-     * A straggler from a round that has already been decided: it would elect
-     * the coordinator we are already following, so re-entering ELECTION would
-     * only restart a settled system.
+     * A straggler from a round that has already been decided: re-entering
+     * ELECTION for it would only restart a settled system.
+     *
+     * <p>
+     * Two independent signs of staleness, both requiring that we are not in a
+     * round ourselves and that we do not suspect the coordinator we follow:
+     * </p>
+     * <ol>
+     * <li><b>we are that coordinator.</b> The project description assumes crash
+     * detection to be accurate, so no correct replica can be running a round
+     * against a coordinator that is demonstrably alive — this message belongs
+     * to a round about some earlier crash, already settled by our own
+     * election. Recognising it here matters: the payload of a restarted round
+     * does not carry our entry yet, so the winner computed on it is somebody
+     * else and the test below would miss the case, dragging a healthy
+     * coordinator into a superfluous election and burning an epoch;</li>
+     * <li><b>the round, as it stands, would elect the coordinator we are
+     * already following.</b></li>
+     * </ol>
      */
     private boolean isStaleElection(Election msg) {
-        if (participating || msg.latestPerReplica.isEmpty() || suspected.contains(coordinatorId)) {
+        if (participating || suspected.contains(coordinatorId)) {
             return false;
         }
-        return ElectionLogic.winner(msg.latestPerReplica) == coordinatorId;
+        if (isCoordinator()) {
+            return true;
+        }
+        return !msg.latestPerReplica.isEmpty()
+                && ElectionLogic.winner(msg.latestPerReplica) == coordinatorId;
+    }
+
+    /**
+     * Updates to put in the {@code Synchronization} that answers a stale
+     * {@code Election}. Its payload says how far behind the participants of
+     * that round are; an {@code Election} carrying no entry at all says
+     * nothing, so we replay the whole log and let the recipient skip what it
+     * has already delivered — delivery is idempotent on the {@link UpdateID}.
+     */
+    private List<Update> syncPayloadFor(Election msg) {
+        return msg.latestPerReplica.isEmpty()
+                ? history.asList()
+                : SyncPlan.missingForAll(history, msg.latestPerReplica);
     }
 
     // handle acks and timeouts
@@ -723,6 +755,12 @@ public class Replica extends AbstractReplica {
         electionStartedFired = false;
         lastForwardedElection = null;
 
+        // Proof of life. Joining a round about a coordinator that had in fact
+        // already been replaced makes us suspect the replica we were following
+        // (see onElection); this message shows it is alive, so it must not
+        // stay blacklisted in the ring.
+        suspected.remove(msg.newCoordinatorId);
+
         coordinatorId = msg.newCoordinatorId;
         log("SYNCHRONIZATION from " + msg.newCoordinatorId + ": epoch " + msg.newEpoch
                 + ", " + msg.pendingUpdates.size() + " update(s) to replay");
@@ -852,19 +890,43 @@ public class Replica extends AbstractReplica {
     }
 
     /**
+     * Crash condition for a message this replica <em>receives</em>.
+     *
+     * <p>
+     * The coordinator broadcasts to the whole group, itself included, so it is
+     * also a recipient of its own UPDATE, WRITEOK and HEARTBEAT messages. It
+     * has already counted each of them once per recipient inside
+     * {@link #broadcast(Serializable, Crash.Type)}; counting them a second time
+     * on delivery would make a single message advance the counter twice and
+     * break the {@code after_n_messages_of_type} semantics. Hence the rule: for
+     * a broadcast type, whoever sent it counts on the way out, everybody else
+     * counts on the way in.
+     * </p>
+     *
+     * <p>
+     * ELECTION messages never go through {@code broadcast}, so their handler
+     * calls {@link #checkCrashCondition(Crash.Type)} directly.
+     * </p>
+     */
+    private boolean checkIncomingCrashCondition(AbstractReplica.Crash.Type type) {
+        return isCoordinator() || checkCrashCondition(type);
+    }
+
+    /**
      * Increments the counter for the given message type.
      * Returns true if the replica should process the message,
      * or false if the replica just crashed and should drop it.
      *
      * <p>
-     * The counter is shared between the two sides of the protocol: an incoming
-     * message is counted when it is about to be processed (UPDATE, WRITEOK,
-     * HEARTBEAT and ELECTION handlers), an outgoing one is counted once per
-     * recipient inside {@link #broadcast(Serializable, Crash.Type)}. There is
-     * no ambiguity because for any given type a replica is either the one
-     * broadcasting it or one of the receivers. So Crash(Update, n) reads as
-     * "die after having sent the UPDATE to n replicas" on the coordinator and
-     * as "die after having processed n UPDATEs" on everybody else.
+     * A single counter per type serves both sides of the protocol, and each
+     * message advances it exactly once: an outgoing one is counted per
+     * recipient inside {@link #broadcast(Serializable, Crash.Type)}, an
+     * incoming one when the handler is about to process it — but only if this
+     * replica is not the one that broadcast it, see
+     * {@link #checkIncomingCrashCondition(Crash.Type)}. So Crash(Update, n)
+     * reads as "die after having sent the UPDATE to n replicas" on the
+     * coordinator and as "die after having processed n UPDATEs" on everybody
+     * else.
      * </p>
      */
     private boolean checkCrashCondition(AbstractReplica.Crash.Type type) {

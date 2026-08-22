@@ -41,10 +41,10 @@ public class CornerCases {
      * The coordinator dies after having sent the UPDATE to two replicas only.
      * The proposal never reaches a quorum of ACKs, so no WRITEOK is ever
      * issued and no replica delivers it: discarding it is the correct outcome,
-     * because no client was ever told the write had succeded.
+     * because no client was ever told the write had succeeded.
      *
      * What must not happen is the client request being lost with it. The
-     * contacted replica keeps the request bufered while the election runs and
+     * contacted replica keeps the request buffered while the election runs and
      * replays it to the new coordinator, so the write completes in the new
      * epoch and every correct replica converges to that value.
      */
@@ -104,7 +104,7 @@ public class CornerCases {
                 ActorRef.noSender());
 
         // The one replica that saw the WRITEOK is the one that answers the
-        // client, so from the outside the write is simply succeded.
+        // client, so from the outside the write has simply succeeded.
         probe.fishForMessage(
                 Duration.ofMillis(TestsCommons.getMaxUpdateDelay(sys)),
                 "WriteResult",
@@ -148,7 +148,7 @@ public class CornerCases {
         Set<Integer> survivors = new HashSet<>(Arrays.asList(1, 4, 5, 6));
 
         // The election terminates in spite of the two consecutive holes, and
-        // everybody that surviced agrees on the same winner.
+        // everybody that survived agrees on the same winner.
         int elected = awaitAgreedCoordinator(sys, survivors);
         assertTrue(survivors.contains(elected),
                 "the new coordinator must be one of the surviving replicas, got " + elected);
@@ -240,7 +240,7 @@ public class CornerCases {
         Set<Integer> alive = survivorsExcept(N, VICTIM);
         assertConverged(sys, alive, TestsCommons.TEST_VALUE);
 
-        // The coordinator never stopped beating, so nobody had any reason tio
+        // The coordinator never stopped beating, so nobody had any reason to
         // suspect it: the loss of a replica must not disturb the epoch.
         assertNoElectionStarted(sys, alive);
 

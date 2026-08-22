@@ -4,6 +4,16 @@ Documento operativo che definisce tutti gli sprint e le fasi necessarie a
 completare il progetto. È volutamente in italiano; identificatori, log e
 report restano in inglese come da convenzione del corso.
 
+> **Stato al 2026-08-22** (base `d854f59` + le correzioni dell'audit di §5.4).
+> Sprint 0-4, 5.2 e 5.4 **completati**. `./gradlew build` verde,
+> **98 test su 98 passati** in due esecuzioni consecutive, zero flakiness; i
+> quattro scenari di `./gradlew run` girano end-to-end.
+> **Resta solo lo Sprint 5.1 (report LaTeX) e lo Sprint 5.3 (consegna).**
+>
+> Per la descrizione di *come funziona il codice* — file per file, classe per
+> classe, metodo per metodo — vedi
+> [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
+
 ## Documenti sorgente
 
 Tutti i requisiti vengono da questi documenti (`docs/`):
@@ -178,27 +188,197 @@ modulo lungo l'interfaccia**, con tag di ownership su ogni task:
   timeout→elezione, Synchronization, anti-livelock) si fa in pair programming
   quando A ha finito lo Sprint 2.
 
-### Fase 0 — Contratto delle interfacce  ⚠️ FARE PER PRIMA, INSIEME
+### Fase 0 — Contratto delle interfacce  ✅ COMPLETATA E CHIUSA
 
-> 📄 **Dettaglio completo in [`CONTRACT_PHASE0.md`](CONTRACT_PHASE0.md)** —
-> catalogo messaggi congelato, contratto FSM/timeout, stub delle classi di B e
-> le decisioni D1–D5 da chiudere. Quanto segue è il riassunto.
+> **Nota storica.** Questo era il contenuto del file `CONTRACT_PHASE0.md`, che
+> congelava i confini fra i due flussi di lavoro *prima* di scrivere codice di
+> logica. Il contratto è stato onorato per intero e le cinque decisioni aperte
+> sono state chiuse dall'implementazione, quindi il documento separato è stato
+> **assorbito qui** ed eliminato dal repository. Le annotazioni "esito"
+> registrano ciò che il codice fa oggi.
 
 Mezza giornata a tavolino per fissare i confini fra i due flussi, così A e B
-lavorano su file diversi senza conflitti di merge. Da congelare:
+lavorano su file diversi senza conflitti di merge.
 
-- Firma definitiva dei messaggi: `Heartbeat`, `Election`, `ElectionAck`,
-  `Synchronization` (campi, tipi, immutabilità). Già abbozzati in §1.2.
-- Nomi ed enum degli stati FSM: `NORMAL` / `ELECTION` / `CRASHED`.
-- Enum `Crash.Type` **completo** — inclusi i valori che userà solo lo
-  Sprint 3 (`Election`), così B non tocca l'enum dopo.
-- Nomi dei timeout e loro payload (`HeartbeatTimeout`, `ElectionAckTimeout`,
-  `GlobalElectionTimeout`).
-- Firma dei metodi di confine che A espone e B consuma (es. `startElection()`,
-  accesso a `latestId()` / `UpdateHistory`, calcolo del successore nel ring).
+#### F0.1 Mappa di ownership dei file
 
-**Exit criteria Fase 0**: interfacce/POJO compilano (`./gradlew build` verde)
-con corpi-stub, così i due branch partono da una base condivisa.
+Il vincolo anti-conflitto era: **A e B non toccano mai lo stesso file** durante
+il lavoro parallelo. L'unico file condiviso (`Replica.java`) era di A fino al
+merge; B ci ha messo le mani solo in pair durante l'integrazione `[A+B]`.
+
+| File / package                                         | Owner | Fase                     |
+|--------------------------------------------------------|-------|--------------------------|
+| `Replica.java`                                          | **A** | Sprint 2 + merge `[A+B]` |
+| `messages/Heartbeat`, `HeartbeatTimeout`                | **A** | Sprint 2                 |
+| `messages/UpdateTimeout`, `ForwardTimeout`              | **A** | Sprint 2                 |
+| `election/` (package)                                   | **B** | Sprint 3 statico         |
+| `messages/Election`, `ElectionAck`                      | **B** | Sprint 3                 |
+| `messages/Synchronization`                              | **B** | Sprint 3                 |
+| `messages/ElectionAckTimeout`, `GlobalElectionTimeout`  | **B** | Sprint 3                 |
+| `src/test/.../election/` (unit test puri)               | **B** | Sprint 3 statico         |
+| `AbstractReplica.java`, `AbstractClient.java`           | **—** | **codebase, INTOCCABILE** |
+| `UpdateID`, `Update`, `UpdateHistory`                   | **—** | congelati in Fase 0      |
+
+`AbstractReplica`/`AbstractClient` sono della codebase obbligatoria
+Genetti/Pasquali: **non si modificano**. Se serve un metodo lì dentro, la
+soluzione è un helper in `Replica` (A) o in `election/` (B).
+
+#### F0.2 Catalogo messaggi — congelato
+
+Firme definitive (in `src/main/java/it/unitn/ds/messages/`). Tutti
+`Serializable` e immutabili.
+
+| Messaggio               | Campi                                                                | Owner |
+|-------------------------|----------------------------------------------------------------------|-------|
+| `Heartbeat`             | *(nessuno)*                                                          | A |
+| `HeartbeatTimeout`      | *(nessuno)* — self-message                                           | A |
+| `UpdateTimeout`         | `UpdateID id` — self-message della replica in fase-1                 | A |
+| `ForwardTimeout`        | `long reqId`, `int index`, `int value` — self-message dopo il forward | A |
+| `Election`              | `int initiatorId`, `Map<Integer,UpdateID> latestPerReplica`          | B |
+| `ElectionAck`           | *(nessuno)* — vedi D1                                                | B |
+| `ElectionAckTimeout`    | `int successorId` — self-message                                     | B |
+| `GlobalElectionTimeout` | *(nessuno)* — self-message                                           | B |
+| `Synchronization`       | `int newCoordinatorId`, `int newEpoch`, `List<Update> pendingUpdates` | B |
+
+Semantica congelata dei due messaggi non ovvi:
+
+- **`Election.latestPerReplica`**: ogni replica che gestisce il messaggio
+  inserisce la propria entry `id -> latestId` e forwarda al successore. Valore
+  per una replica con history vuota = `new UpdateID(0, 0)` (sentinella, D2).
+- **`Synchronization`**: inviato dal vincitore in broadcast. `pendingUpdates` =
+  update orfani che ogni destinatario deve applicare *prima* di adottare
+  `newEpoch`; `newEpoch` è calcolato dal vincitore (D3).
+
+#### F0.3 Enum `Crash.Type` — congelato
+
+Definito in `AbstractReplica.Crash.Type`, **già completo** nella codebase e
+quindi intoccabile:
+
+```
+Now, Heartbeat, Update, WriteOK, Election
+```
+
+Semantica (regola 10 della codebase): `Crash(type, after_n_messages_of_type)` =
+processa `n` messaggi di quel tipo, **crasha all'(n+1)-esimo**. `Now` = crash
+immediato. Il conteggio per tipo è interno ad A (`checkCrashCondition` +
+`become(crashed())`); a B bastava sapere che `Election` è un punto di crash
+valido durante l'elezione.
+
+#### F0.4 Contratto della FSM (stati e `become`) — owner A
+
+| Stato | Metodo behavior | Messaggi gestiti |
+|-------|-----------------|------------------|
+| `NORMAL`   | `createReceive()` | base (`Crash`, `InitSystem`) + `ClientRead/Write`, `ForwardWrite`, `UpdateMsg`, `UpdateAck`, `WriteOk`, `Heartbeat`, `HeartbeatTimeout`, `UpdateTimeout`, `ForwardTimeout` |
+| `ELECTION` | `election()`      | `Crash` + `Election`, `ElectionAck`, `ElectionAckTimeout`, `GlobalElectionTimeout`, `Synchronization`; write in ingresso **bufferizzate** (D4) |
+| `CRASHED`  | `crashed()`       | **nessuno** — `receiveBuilder().matchAny(ignore).build()`; **mai** `getContext().stop()` |
+
+Regole congelate, tutte rispettate:
+
+- transizioni via `getContext().become(...)`: `NORMAL → CRASHED` (crash),
+  `NORMAL → ELECTION` (heartbeat/forward/update timeout o ricezione di
+  `Election`), `ELECTION → NORMAL` (vittoria o `Synchronization` processata),
+  `* → CRASHED`;
+- `crashed()` **non** parte da `createBaseReceiveBuilder()` (altrimenti
+  ri-gestirebbe `Crash`): è un receive che ignora tutto;
+- l'invio è **sempre** `this.tell(Serializable, ActorRef)` (canale FIFO
+  emulato). **Mai** `getSelf().tell(...)` né `getContext().stop()`.
+
+**Esito**: rispettato integralmente. In più, in `NORMAL` sono agganciati anche
+i messaggi di elezione, perché una replica che non ha ancora rilevato il crash
+può essere trascinata in un round o apprenderne l'esito senza passare da
+`ELECTION`.
+
+#### F0.5 Contratto dei timeout — self-scheduled
+
+| Timeout                 | Schedulato da                    | Durata concordata                     | Owner | Esito |
+|-------------------------|----------------------------------|---------------------------------------|-------|-------|
+| `HeartbeatTimeout`      | replica non-coordinatrice        | `~3 × getCoordinatorBeatInterval()`   | A | ✅ `3 × beat` |
+| `UpdateTimeout`         | replica in fase-1                | `getMaxLatencyPlusTolerance()`        | A | ⚠️ implementato a `3 × beat`: più conservativo, evita falsi positivi |
+| `ForwardTimeout`        | replica dopo il forward al coord | `getMaxLatencyPlusTolerance()`        | A | ⚠️ idem, `3 × beat` |
+| `ElectionAckTimeout`    | replica che forwarda `Election`  | `getMaxLatencyPlusTolerance()`        | B | ✅ |
+| `GlobalElectionTimeout` | replica in `ELECTION`            | `N × ElectionAckTimeout`              | B | ✅ `N × maxLatencyPlusTolerance × 2` |
+
+Pattern condiviso e rispettato: ogni timer per-scopo sta in un `Cancellable`
+(o in una `Map<chiave, Cancellable>` per quelli per-update / per-richiesta) e
+viene **cancellato** all'arrivo della risposta attesa, per non far scattare
+falsi positivi.
+
+#### F0.6 API di confine fra A e B — congelata
+
+Riusate dal modello dati esistente, senza lavoro aggiuntivo:
+
+```java
+Optional<UpdateID> UpdateHistory.latestId();  // per riempire Election.latestPerReplica
+List<Update>       UpdateHistory.after(UpdateID t);  // diff di Synchronization
+int      UpdateID.compareTo(UpdateID other);  // ordine lessicografico <epoch,seq>
+```
+
+Callback obbligatorie di `AbstractReplica` (timing in F0.8):
+
+```java
+void callbackOnElectionStarted(int crashedCoordinatorId);
+void callbackOnCoordinatorElected(int newCoordinatorId);
+void callbackOnUpdateApplied(int index, int value);
+```
+
+Nuove classi di B, package `it.unitn.ds.election` — logica pura, senza attori,
+unit-testabile in isolamento. Firme congelate in Fase 0 come stub che
+lanciavano `UnsupportedOperationException`, riempite in Sprint 3:
+
+```java
+RingTopology.order(Collection<Integer> memberIds) -> List<Integer>
+RingTopology.successor(int self, Collection<Integer> memberIds, Set<Integer> suspected) -> Optional<Integer>
+ElectionLogic.NONE                                                   // sentinella (D2)
+ElectionLogic.winner(Map<Integer,UpdateID> latestPerReplica) -> int
+SyncPlan.missingFor(UpdateHistory winnerHistory, UpdateID recipientLatest) -> List<Update>
+```
+
+**Esito**: tutte e cinque implementate con la firma concordata. In corso d'opera
+sono stati aggiunti tre metodi non previsti dal contratto, tutti puri e testati:
+`ElectionLogic.latestOf`, `ElectionLogic.withEntry`, `ElectionLogic.newEpoch`,
+più `SyncPlan.oldest` e `SyncPlan.missingForAll` (il broadcast unico calcolato
+sul watermark).
+
+Seam esposto da A e usato dall'integrazione:
+
+```java
+void startElection(int crashedCoordinatorId);   // Replica.java:485
+```
+
+#### F0.7 Le cinque decisioni D1–D5 — **tutte chiuse**
+
+| # | Decisione | Raccomandazione di Fase 0 | Esito nel codice |
+|---|-----------|---------------------------|------------------|
+| D1 | correlazione di `ElectionAck` | tenerlo vuoto, scartare gli ack inattesi | ✅ **come raccomandato**: ack vuoto, hop-by-hop fra vicini |
+| D2 | sentinella per history vuota | `NONE = new UpdateID(0,0)` | ✅ **come raccomandato** (`ElectionLogic.java:26`) |
+| D3 | calcolo di `newEpoch` | `maxEpochVisto + 1`, dopo aver completato gli orfani | ✅ **come raccomandato**, con il massimo preso su **tutto** il payload e non solo sulla history del vincitore (`ElectionLogic.newEpoch`) |
+| D4 | write in arrivo durante `ELECTION` | droppare, il client ritenta | ❗ **risolta al contrario**: il client di questo progetto **non ritenta mai**, quindi droppare significherebbe perdere la richiesta. Le write sono **bufferizzate** in `clientWrites` e rigiocate al nuovo coordinatore (`onClientWriteDuringElection`, `replayPendingClientWrites`) |
+| D5 | sorgente del set `suspected` | coordinatore crashato + successori senza ack | ✅ **come raccomandato** (`Replica.suspected`, alimentato da `startElection` e `onElectionAckTimeout`) |
+
+#### F0.8 Timing delle callback — congelato
+
+- `callbackOnElectionStarted(crashedCoordId)` — **esattamente una volta per
+  partecipazione all'elezione**, alla prima `Election` inviata da questa
+  replica. Garantito dal flag `electionStartedFired`, che **non** viene
+  riazzerato dal `GlobalElectionTimeout`.
+- `callbackOnCoordinatorElected(newCoordId)` — sul **vincitore** quando decide
+  di aver vinto, e su **ogni altra replica** al processamento della
+  `Synchronization`.
+- `callbackOnUpdateApplied(idx, val)` — una volta per write applicata, anche per
+  gli update orfani riapplicati durante la sync. Invocata da un solo punto del
+  codice (`applyUpdate`).
+
+#### F0.9 Exit criteria della Fase 0 — tutti raggiunti
+
+- [x] le 3 classi stub in `election/` create con le firme di F0.6;
+- [x] gli stub dei test in `src/test/.../election/` creati;
+- [x] le 5 decisioni D1–D5 chiuse (F0.7);
+- [x] `./gradlew build` verde;
+- [x] i test dello Sprint 1 non regrediti.
+
+I due branch `sprint2-detection` e `sprint3-election` sono partiti dallo stesso
+commit con contratto verde; `sprint3-election` è stato mergiato in `main` con
+`6c01abe`.
 
 ---
 
@@ -336,37 +516,47 @@ successivi.
 
 ---
 
-## Sprint 4 — Corner case del fault model  ⚠️ PARZIALE
+## Sprint 4 — Corner case del fault model  ✅ COMPLETATO
 
 Obiettivo: tutti i test del codebase (`NoCrashes`, `WithCrashes`,
 `APICompliance`) verdi, inclusi gli scenari che la traccia §1 "Properties"
-chiama "partial dissemination".
+chiama "partial dissemination", **più** una suite dedicata ai punti di crash
+che la traccia §2 chiede di poter innescare (*"trigger crashes at specific
+points in the protocol execution"*).
 
-Casi minimi da coprire (traccia §2: *"trigger crashes at specific points in
-the protocol execution"*). L'istrumentazione per innescarli tutti **c'è**
-(`broadcast(msg, crashPoint)` permette il broadcast parziale); quello che
-manca sono i test automatici dedicati.
+L'istrumentazione che li rende innescabili è `broadcast(msg, crashPoint)`
+(`Replica.java:785`), che valuta la condizione di crash **una volta per
+destinatario** e produce quindi broadcast parziali riproducibili.
+
+La suite è in `src/test/java/it/unitn/ds/scenarios/CornerCases.java`
+(5 casi end-to-end). Ogni scenario mantiene viva una maggioranza stretta, come
+impone il modello di guasto.
 
 | # | Caso | Come si innesca | Stato |
 |---|------|-----------------|-------|
-| 1 | Coordinatore crasha **durante il broadcast di UPDATE** | `Crash(Update, k)` sul coordinatore, `k < N` | innescabile, nessun test |
-| 2 | Coordinatore crasha **dopo WRITEOK ad alcuni** — uniform agreement | `Crash(WriteOK, k)` sul coordinatore | innescabile, **coperto dalla Demo 4** |
-| 3 | **Due nodi consecutivi** crashano durante l'elezione | `Crash(Now, 0)` su due id adiacenti | unit test su `RingTopology`, nessun test end-to-end |
-| 4 | Vincitore crasha **prima della Synchronization** | `Crash(Election, k)` sul futuro vincitore | logica presente (`GlobalElectionTimeout`), nessun test |
-| 5 | Replica crasha **dopo l'ACK**, prima del WriteOk | `Crash(Update, 0)` su una non-coordinatrice | innescabile, nessun test |
+| 1 | Coordinatore crasha **durante il broadcast di UPDATE** | `Crash(Update, 2)`, N=5 | ✅ `coordinatorCrashesDuringUpdateBroadcast` |
+| 2 | Coordinatore crasha **dopo WRITEOK ad alcuni** — uniform agreement | `Crash(WriteOK, 2)` | ✅ `coordinatorCrashesDuringWriteOkDissemination` + Demo 4 |
+| 3 | **Due nodi consecutivi** crashano durante l'elezione | `Crash(Now, 0)` su due id adiacenti, N=7 | ✅ `twoConsecutiveReplicasCrashDuringElection` |
+| 4 | Vincitore crasha **prima della Synchronization** | `Crash(Election, 1)` sul futuro vincitore | ✅ `electionWinnerCrashesBeforeSynchronization` |
+| 5 | Replica crasha **dopo l'ACK**, prima di applicare | `Crash(WriteOK, 0)` su una non-coordinatrice | ✅ `replicaCrashesAfterAckBeforeApplying` |
 | 6 | Client contatta una replica crashed | `Crash(Now, 0)` + richiesta | ✅ `APICompliance.crashReplicaAndTryRequests` |
 
-**Exit criteria**: `./gradlew test` interamente verde (✅ oggi: 93/93) **più**
-una suite dedicata ai casi 1-5 sopra, da scrivere in
-`src/test/java/it/unitn/ds/scenarios/`.
+Il caso 4 è quello che giustifica il `GlobalElectionTimeout`: se il vincitore
+muore prima di annunciarsi, nessun altro meccanismo sbloccherebbe il sistema.
+Il caso 5 verifica anche il negativo — che **nessuna elezione venga avviata**
+quando il coordinatore è vivo.
+
+**Exit criteria** — tutti raggiunti:
+- ✅ `./gradlew test` interamente verde: **98/98**, su due run consecutivi;
+- ✅ suite dedicata ai casi 1-5 in `src/test/java/it/unitn/ds/scenarios/`.
 
 ---
 
-## Sprint 5 — Report, demo e consegna
+## Sprint 5 — Report, demo e consegna  ⚠️ IN CORSO (unico sprint aperto)
 
 Riferimento traccia §3 (report) e §4 (presentation & submission).
 
-### 5.1 Report LaTeX  ❌ DA FARE
+### 5.1 Report LaTeX  ❌ DA FARE — **unico blocco alla consegna**
 
 - Template fornito (linkato in traccia §3) — già presente in `report/`.
 - 3-4 pagine, **max 6** ("Reports exceeding this page limit will be
@@ -376,8 +566,15 @@ Riferimento traccia §3 (report) e §4 (presentation & submission).
   scelte architetturali, gestione timeout, scelta della topologia del ring,
   trattamento degli update orfani, motivazioni di tie-break, assunzioni
   aggiuntive.
-- Stato attuale `report/`: skeleton `main.tex` + `01_structure.tex`,
-  `02_design.tex`, `03_implementation.tex` — da completare.
+- **Stato attuale `report/`**: `main.tex` compila ma le tre sezioni
+  (`01_structure.tex`, `02_design.tex`, `03_implementation.tex`) sono file di
+  **una sola riga** con il solo `\section{}`; anche
+  `\author{Surname1 Name1, Surname2 Name2}` è ancora il placeholder.
+- Materiale già pronto da cui attingere: `IMPLEMENTATION_STATUS.md` §9 (anatomia
+  di `Replica`), §15 (dimostrazione delle quattro proprietà), §16 (timer e
+  perché niente falsi positivi), §22 (**l'elenco completo delle assunzioni da
+  dichiarare**, che la traccia §2 richiede esplicitamente).
+- Va incluso il disclaimer sull'uso di assistenza AI.
 
 ### 5.2 Demo scenarios  ✅ COMPLETATO
 
@@ -408,34 +605,78 @@ scenario si legga da solo. Tutto passa da `Logger` (niente `System.out`).
 
 ### 5.3 Checklist di consegna (traccia §4)
 
-- [ ] Verificare `./gradlew test` interamente verde su clone pulito.
-- [ ] Report in formato `.pdf` autocontenuto.
-- [ ] Archivio `tar -czvf BianchiCognome2.tgz BianchiCognome2/` con dentro
+- [x] **Committare il wrapper Gradle.** Fatto il 2026-08-22: `.gitignore` non
+  esclude più `gradlew`, `gradlew.bat` e `gradle/wrapper/`, che sono ora
+  tracciati (`gradlew` con il bit di esecuzione). Da un clone pulito basta un
+  JDK 17+ e `./gradlew build`.
+- [ ] Verificare `./gradlew test` interamente verde su clone pulito
+  (sul working tree: ✅ 98/98, due run, anche dopo le correzioni di §5.4).
+- [ ] Report in formato `.pdf` autocontenuto, con i nomi veri al posto dei
+  placeholder del template.
+- [ ] Archivio `tar -czvf CognomeACognomeB.tgz CognomeACognomeB/` con dentro
   sorgenti + report (cartella con i due cognomi). **Non includere** le PDF
-  del prof.
+  del prof in `docs/`.
 - [ ] Prenotare slot di presentazione via mail a Picco + Pasquali + Genetti
   prima della deadline del corrispondente slot.
 - [ ] Indicare in-person vs online.
-- [ ] 12 minuti di presentazione (timer rigido) + Q&A.
+- [ ] 12 minuti di presentazione (timer rigido) + Q&A: usare le 4 demo di
+  `Main` e i 5 corner case come traccia della dimostrazione.
+
+### 5.4 Rifiniture emerse dall'audit  ✅ TUTTE APPLICATE (2026-08-22)
+
+Quattro imperfezioni trovate rileggendo il codice contro la traccia. Nessuna
+faceva fallire un test; sono state comunque risolte tutte, e la suite è stata
+rieseguita due volte dopo le modifiche (**98/98 verdi**). Il dettaglio con
+problema e rimedio è in `IMPLEMENTATION_STATUS.md` §21.
+
+- [x] **Wrapper Gradle non tracciato** → committato, vedi §5.3.
+- [x] **Nove refusi nei commenti** di `Replica.java` (`awating`,
+  `callbackOnElectionSTarted`, `left aliv`, `havea lready`, `Puleld`) e di
+  `CornerCases.java` (`succeded` ×2, `bufered`, `surviced`, `tio`) — la traccia
+  §4 valuta anche la forma del codice.
+- [x] **Doppio conteggio del crash counter sul coordinatore.** `broadcast`
+  include il coordinatore fra i destinatari, quindi per `Update`/`WriteOK`/
+  `Heartbeat` lo stesso messaggio veniva contato due volte, in violazione della
+  semantica `after_n_messages_of_type` (regola 10 della codebase). Gli handler
+  in ricezione passano ora da `checkIncomingCrashCondition`, che non riconteggia
+  i broadcast propri: **un messaggio, un incremento**.
+- [x] **`Election` ritardataria che rimetteva in elezione un coordinatore
+  sano.** `isStaleElection` ora tratta come stantia ogni `Election` che
+  raggiunge il coordinatore in carica — la traccia assume detection accurata,
+  quindi un coordinatore vivo non è mai legittimamente sospettato — e risponde
+  con una `Synchronization` invece di aprire un epoch in più; `onSynchronization`
+  toglie il mittente da `suspected` (prova di vita). La regola della traccia
+  *"if it is not already participating in the election, it adds its own
+  information"* resta invariata per tutte le altre repliche.
+- [x] ~~`CONTRACT_PHASE0.md` con le decisioni D1-D5 formalmente aperte~~ — il
+  contratto è stato assorbito nella Fase 0 di questo documento (§F0.1-F0.9) con
+  l'esito di ciascuna decisione annotato, e il file separato è stato eliminato.
 
 ---
 
 ## Tracciabilità requisiti traccia → sprint
 
-| Requisito traccia                                                | Sprint |
-|------------------------------------------------------------------|--------|
-| §1 Two-phase update (UPDATE/ACK/WRITEOK), quorum ⌊N/2⌋+1         | 1      |
-| §1 UpdateID ⟨epoch, seq⟩                                          | 1      |
-| §1 Heartbeat per liveness coordinatore                            | 2      |
-| §1 Crash detection via timeout                                    | 2      |
-| §1 Ring election, ACK hop-by-hop, skip su timeout                 | 3      |
-| §1 Vincitore = max latest update, tie-break id                    | 3      |
-| §1 Synchronization + completamento update pendenti                | 3      |
-| §1 Uniform agreement con crash del coord a metà broadcast         | 2,3    |
-| §2 Logging formattato e timestamped                               | 1+     |
-| §2 Crashed mode (no `stop`)                                       | 2      |
-| §2 Crash istrumentati per tipo di messaggio                       | 2      |
-| §2 FIFO + latenza random emulata (NetworkChannel)                 | dato   |
-| §2 Immutability dei messaggi inviati                              | 1+     |
-| §3 Report 3-4 pagine LaTeX in inglese                             | 5      |
-| §4 Demo 3-4 scenari + 12 min presentation                          | 5      |
+Per il puntamento **riga per riga** al codice vedi
+`IMPLEMENTATION_STATUS.md` §2.
+
+| Requisito traccia                                                | Sprint | Stato |
+|------------------------------------------------------------------|--------|-------|
+| §1 Two-phase update (UPDATE/ACK/WRITEOK), quorum ⌊N/2⌋+1         | 1      | ✅ |
+| §1 UpdateID ⟨epoch, seq⟩                                          | 1      | ✅ |
+| §1 Read servita localmente, write inoltrata al coordinatore       | 1      | ✅ |
+| §1 Heartbeat per liveness coordinatore                            | 2      | ✅ |
+| §1 Crash detection via timeout (heartbeat, forward, update)       | 2      | ✅ |
+| §1 Ring election, ACK hop-by-hop, skip su timeout                 | 3      | ✅ |
+| §1 Vincitore = max latest update, tie-break id                    | 3      | ✅ |
+| §1 Synchronization + completamento update pendenti                | 3      | ✅ |
+| §1 Uniform agreement con crash del coord a metà broadcast         | 2,3,4  | ✅ |
+| §2 Logging formattato e timestamped                               | 1+     | ✅ |
+| §2 Crashed mode (no `stop`)                                       | 2      | ✅ |
+| §2 Crash istrumentati per tipo di messaggio                       | 2      | ✅ |
+| §2 Crash innescabili in punti specifici del protocollo            | 4      | ✅ |
+| §2 FIFO + latenza random emulata (NetworkChannel)                 | dato   | ✅ |
+| §2 Immutability dei messaggi inviati                              | 1+     | ✅ |
+| §2 Sequenze di write + crash con read concorrenti                 | 1,4    | ✅ |
+| §2 Assunzioni aggiuntive dichiarate                               | 5      | ⚠️ elencate in `IMPLEMENTATION_STATUS.md` §22, da riportare nel report |
+| §3 Report 3-4 pagine LaTeX in inglese                             | 5      | ❌ |
+| §4 Demo 3-4 scenari + 12 min presentation                          | 5      | ✅ demo pronte, presentazione da preparare |
