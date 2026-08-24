@@ -1,1 +1,45 @@
 \section{Implementation}
+
+\subsection*{Storing updates}
+
+Each replica keeps three things: the array \texttt{positions}, an \texttt{UpdateHistory} with the updates it has delivered, and a map from \texttt{UpdateID} to the phase-1 proposals that are not confirmed yet. The coordinator also tracks the lst id assigned, how many acks each id has collected, and the set of ids that already reached the quorum. The last set is what stops a second \texttt{WriteOk} from being sent for the same update when late acks keep arriving.
+
+Delivery happens in one place, \texttt{applyUpdate}, which wirtes the array, appends to the history, fires the mandatory callback and answers the client if this replica is the one that was contacted. Every path that can deliver --- \texttt{WriteOk}, the recovery of interrupted updates, and the \texttt{Synchronization} --- goes through it, and each of them first checks that the id is not already in the history. This is what guarantees integrity: an update is applied at most once, even when the same update arrives both as a \texttt{WriteOk} and inside a synchronization.
+
+\subsection*{Managing timeouts}
+
+Timers are \texttt{Cancellable} objects returned by the scheduler. Since the same kind of timeout can be in flight for several updates at once, the per-update ones are kept in maps rather than in a single field: \texttt{updateTimeouts} keyed by \texttt{UpdateID} and \texttt{forwardTimeouts} keyed by the client request id. Using the request id rather thatn the $(index, value)$ pair matters, because two distinct requests may write the same value at the same index and would otherwise be indistinguishable.
+
+The rule we follow everywhere is \emph{cancel before re-arming}: scheduling a new timer over a variable that still holds a live one makes the old timer impossible to cancel afterwards, and it would eventually fire and trigger a spurious election. Every timer is cancelled as soon as the message it was waiting for arrives: the \texttt{UpdateTimeout} on the corresponding \texttt{UpdateMsg} shows up, the \texttt{UpdateTimeout} on the corresponding \texttt{WriteOk}, the \texttt{ElectionAckTimeout} on the \texttt{ElectionAck}. A crashing replica cancels all of its timers, so that it also stops sending.
+
+\subsection*{Controlling crashes}
+
+A crash is armed from the outside with \texttt{Crash(type, n)}, whose semantics are ``process $n$ messages of that type, then crash''. The counter is kept per type in \texttt{messageCounters} and checked by \texttt{checkCrashCondition}, which is called at the top of the handlers for \texttt{UpdateMsg}, \texttt{WriteOk}, \texttt{Heartbeat} and \texttt{Election}, and returns \texttt{false} when the replica has just died so the handler can stop. \texttt{Crash.Type.Now} crashes immediately.
+
+The same counter is also evaluated inside \texttt{broadcast}, once per recipient and before each send. This is what makes a \emph{partial} broadcast possible: \texttt{Crash(WriteOk, 2)} on the coordinator means it hands the \texttt{WriteOk}, to exactly two replicas and then dies, leaving the others without it. There is no ambiguity between the two uses of the counter, because for any given message type a replica is either the one broadcasting it or one of the receivers, never both. The broadcast walks the group in ascending id order so that the set of replicas that were served is reproducible from one run to the next, which is what makes the corner-case tests deterministic.
+
+Crashing means switching to a behaviour that ignores everything; \texttt{getContext().stop()} is never called. Messages already handed to a \texttt{NetworkChannel} are still delivered, since the channels are not stopped: a crash prevents \emph{starting} new sends, it does not recall messages already in flight.
+
+\subsection*{Client writes across an election}
+
+The supplied client sends each request exactly once and reports a timeout if no answer arrives; it does not retry. A write whose coordinator dies mid-flight would therefore simply be lost. To avoid this, the contacted replica keeps every unanswered client write in \texttt{clientWrites} and replays it to the new coordinator as soon as the election ends. Writes that arrive while the replica is already in ELECTION are buffered on arrival for the same reason. THe nrey is removed then the corresponding \texttt{WriteReply} is finelly sent.
+
+One consequence needed some care: the new coordinator answers every late \texttt{Election} with a \texttt{Synchronization}, so the same announcement can be received more than once. Running the handler twice would replay the buffered writes a second time and turn one client request into two updates, so a \texttt{Synchronization} that we have alreay adopted --- same coordinator, same epoch, and we are not in an election --- is recognized and ignored.
+
+\subsection*{Testing}
+
+The suite has 98 tests, al passing. Besides the tests supplied with the codebase (\texttt{NoCrashes}, \texttt{WithCrashes}, \texttt{APICompliance}), there are pure unit tests for the three classes of the \texttt{election} package, which run without an actor system, and and end-to-end suite \texttt{scenarios/CornerCases} that drives the crash instrumentation into the dive interesting points of the protocol: coordinator dying during the \texttt{UPDATE} broadcast; coordinator dying with the \texttt{WRITEOK} only partially disseminated; two \emph{consecutive} ring neighbours crashing, so the election has to skip twice in a row; the winner crashing before announcing itself, which only the \texttt{GlobalElectionTimeout} can resolve; and a replica dying after its ack but before applying, which must not disturb the epoch.
+
+\texttt{Main} contains four demo scenarios (\texttt{./gradlew run}), each with its own actor system so that its log can be read on its own.
+
+\subsection*{Additional assumptions}
+
+\begin{enumerate}[nosep]
+\item \textbf{Messages already queued survive a crash.} The channel actors of a crashed replica are not stopeed, so what was already handed to them is still delivered.
+\item \textbf{\texttt{ElectionAck} carries no correlation id.} The handler cancels the current timer without checking who sent the ack. A late ack from an already skipped successor can therefore cancel a timer just re-armed for another once; the worst effect is a slower round, covered by the \texttt{GlobalElectionTimeout}.
+\item \textbf{The winner also delivers updates that never reached a quorum.} Recovery applies every pending phase-1 proposal, including those with fewer than $\lfloor N/2 \rfloor + 1$ acks. This is the conservative choice --- complete rather than discard --- and it violates none of the four properties, since all correct replicas converge on the same state through the synchronization.
+\item \textbf{Reads during an election are served locally} and may return a value that is about to be superseded. This is sequential consistency, which is what the project asks for.
+\item \textbf{Client-to-replica traffic does not go through the simulated channel.} \texttt{AbstractClient} does not expose the channel helper, so that one direction has no artificial delay; replica-to-replica and replica-to-client traffic does.
+\item \textbf{The buffer of client writes is unbounded.} With short elections and test clients this is not a concern, but a very long election could make it grow without limit.
+\item \textbf{Membership is static and the \texttt{suspected} set only grows}, consistently with replicas that fail by crashing and never recover.
+\end{enumerate}

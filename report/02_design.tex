@@ -1,1 +1,74 @@
 \section{System Design}
+
+\subsection*{Replica states}
+
+A replica is always in one of three behaviours, switched with \texttt{getContext().become(...)}:
+
+\begin{itemize}
+\item \textbf{NORMAL} --- the two-phase broadcast and crash detection.
+\item \textbf{ELECTION} --- a round is in progress. Reads are still served locally, incoming client writes are buffered, and all messages of the dying epoch (\texttt{UpdateMsg}, \texttt{WriteOk}, heartbeats and their timeouts) are ignored.
+\item \textbf{CRASHED} --- every message is dropped.
+\end{itemize}
+
+The transitions are: NORMAL $\to$ ELECTION when a crash of the coordinator is detected or an \texttt{Election} message arrives; ELECTION $\to$ NORMAL when the round ends, either because this replica won or because a \texttt{Synchronization} was received; and anything $\to$ CRASHED when a crash is triggered.
+
+Ignoring updates while in ELECTION is what implements Hint~1 of the assignment: the ``latest known update'' a replica pusblishes must not change while it is a candidate, otherwise two replicas could compare payloads buitl at different moments. The crashed behaviour is a receive that matches anything and does nothing; the actor is deliberately \emph{not} stopped, so that senders keep seeing a silent node rather than dead letters.
+
+\subsection*{Update protocol}
+
+A read is answered immediately by the contacted replica from its local array. A write is forwarded to the coordinator (oe handled directly, if the contacted replica is the coordinator). The coordinator assigns the next id $\langle e, i \rangle$ in the current epoch and broadcasts an \texttt{UpdateMsg}. Every replica stores the proposal as pending and replies with an \texttt{UpdateAck}. When the coordinator has collected $|Q| = \lfloor N/2 \rfloor + 1$ acknowledgements it broadcasts \texttt{WriteOk}, and each replica then applies the update to its array, appends it to its history and, if it is the replica the client contacted, sends the \texttt{WriteReply}.
+
+The coordinator is a replica like the others and sends both broadcasts to itself as well, so it applies the update through its own \texttt{WriteOk} and its own acknowledgement counts towards the quorum, as the assignment requires.
+
+Total order follows from three facts: within an epoch there is a single coordinator, which is the only source of \texttt{UpdateMsg} and \texttt{WriteOk}; channels are FIFO per sender--receiver pair, so every replica sees that coordinator's \texttt{WriteOk} messages in the order they were sent; and across epochs the epoch number is strictly increasing, so an update of epoch $e' > e$ in the $\langle epoch, sequence \rangle$ order.
+
+Because reads are served locally without contacting the coordinator, a client that writes and then immediately reads from the same replica may still observe the old value: the write has to complete a round trip through the coordinator before it is applied anywhere. This is sequential consistency from the point of view of a client that always talks to the same replica, which is what the project requires, not linearizability.
+
+\subsection*{Crash detection}
+
+The coordinator broadcasts a \texttt{Heartbeat} every second. A replica suspects it in three situations, exactly the ones listed in the assignment:
+
+\begin{center}
+  \begin{tabular}{l l l}
+    \textbf{Timeout} & \textbf{Armed when} & \textbf{Value} \\
+    \hline
+    \texttt{HeartbeatTimeout}    & always, on a non-coordinator          & $3 \times 1000$~ms \\
+    \texttt{UpdateTimeout}       & an \texttt{UpdateMsg} was ack'd       & $3 \times 1000$~ms \\
+    \texttt{ForwardTimeout}      & a write was forwarded to the coord.   & $3 \times 1000$~ms \\
+    \texttt{ElectionAckTimeout}  & an \texttt{Election} was forwarded    & $20 + 10N$~ms \\
+    \texttt{GlobalElectionTimeout} & the replica entered ELECTION        & $2N \times (20 + 10N)$~ms \\
+  \end{tabular}
+\end{center}
+
+The heartbeat watchdog is reset by \emph{any} message coming from the coordinator, not only heartbeats: an \texttt{UpdateMsg} or a \texttt{WriteOk} is just as good a proof of life. The first three timeouts are three beats long, which is generous with respect to the $5$--$20$~ms simulated latency; the project assumes crash detection is accurate and does not produce false positives, so we preferred slow detection over the rist of suspecting a live coordinator. The two election timeouts are instead scaled on \texttt{getMaxLatencyPlusTolerance()}, which already grows with $N$, because they bound one hop and one full ring lap respectively.
+
+\subsection*{Coordinator election}
+
+The ring is the replica ids in ascending order; the successor of a replica is the next id, wrapping around, skipping every id in a local \texttt{suspected} set. That set starts with the coordinator believed to be dead and grows with every successor that fails to acknowledge.
+
+A replica that detects the crash enters ELECTION and sends \texttt{Election} message carrying a map $id \mapsto latestId$ containing its own entry, where the value is the id of its most recent delivered update, or the sentinel $\langle 0, 0 \rangle$ if its history is emtpy. Each replica that receives the message acknowledges the sender immediately, adds its own entry if not already present, and forwards it to its successor.
+
+When a replica receives a payload that already contains its own id, the message has completed a full lap and the payload is final. The winnder is then computed locally as the replica with the greatest latest id, ties broken by the greatest replica id. Since the payload is the same for everybody every replica computes the same winner without any further round. A replica that recognises itself as the winner takes over; a replica that is not the winner simply keeps the message circulating, so that it reaches the winner.
+
+Crashes during the election are handled by the hop-by-hop acknowledgement: the sender of an \texttt{Election} arms an \texttt{ElectionAckTimeout}, if it expires, adds the silent successor to \texttt{suspected} and re-sends the same payload to the following replica in the ring. Because a strict majority is always alive, this always, terminates on a live replica, and at least one live replica necessarily holds the most recent update.
+
+\subsection*{What the new coordinator does}
+
+The winner performs the following steps, in this order:
+
+\begin{enumerate}[nosep]
+\item it completes the interrupted updates --- every phase-1 proposal still pending in its own state is applied now (Hint~3);
+\item it sets its next id to $\langle e_{new}, 0\rangle$, where $e_{new}$ is one more than the highest epoch appearing in the election payload, so the sequence number restarts from $0$ at every epoch change;
+\item it broadcasts a \texttt{Synchronization} carrying the new epoch and the updates the others may be missing;
+\item it starts emitting heartbeats and returns to NORMAL.
+\end{enumerate}
+
+Step~1 must precede Step~3, otherwise the recovered updates would not be part of the announcement. This is what makes uniform agreement hold: if the old coordinator died with the \texttt{WriteOk} delivered to a single replica, that replica is the only one holding the update, and it is exactly the one that wins the election --- so the update is put back into circulation instead of being lost with the old epoch. The list to replay is computed once, as the diff between the winner's history and the \emph{most lagging} participant of the election, so that a single broadcast brings everybody up to date; replicas that already delivered part of it skip those entries, since delivery is idempotent on the update id.
+
+The replicas that receive \texttt{Synchronization} adopt the new coordinator and epoch, apply the updates they are missing, discard whatever is left of the dead epoch and go back to NORMAL.
+
+\subsection*{Making sure the election terminates}
+
+The dangerous case (Hint~2) is the winner crashing after the payload has completed its lap but before the \texttt{Synchronization} is sent: the message dies with it and everybody else waits forever. For this reason every replica that enters ELECTION also arms a \texttt{GlobalElectionTimeout}, long enough for a full ring lap in which every hop times out. When it fires, the replica simply starts a fresh round. Since the dead winner is by then suspected by at least its predecessor, and suspicion only grows, the second round converges on a live replica.
+
+A second, subtler termination problem is a late \texttt{Election} message from a round that has already been decided. Processing it would drag a settled system back into an election. Such a message is recognized because it would elect the coordinator we are already following, and is dropped; if we are that coordinator, we answer with a \texttt{Synchronization} so that the sender, which is evidently still stuck in the old round, can move on.

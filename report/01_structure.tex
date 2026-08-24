@@ -1,1 +1,49 @@
 \section{Project Structure}
+
+The system is a replicated array of integers kept consistent by a two-phase total order broadcast, coordinated by one distinguished replica. When the coordinator crashes, the surviving replicas eòect a new one with a ring-based algorithm and resume service in a new epoch.
+
+\subsection*{Actors}
+
+There are three kinds of actor. \texttt{Replica} holds a local copy of the array and implements the whole protocol: it serves reads, forwards writes to the coordinator, participates in the two-phase broadcast, detects crashes and takes part in the elections. \texttt{Client} sends read and write requests to a replica and arms a timeout on each of them. \texttt{NetworkChannel} is the FIFO channel actor supplied with the codebase: one instance per (sender, destination) pair, it delays every message by a random amount between $5$ and $20$~ms while preserving order, which emulates network propagation delay. All replica-to-replica and replica-to-client traffic goes through \texttt{AbstractReplica.tell(msg, dst)}, which routes the message through the proper channel.
+
+\texttt{AbstractReplica} and \texttt{AbstractClient} come from the mandatory codebase and were not modified. They provide the crash command, the initialization message, the logging helpers and the callbacks thath the automated tests observe.
+
+\subsection*{Packages}
+
+\begin{verbatim}
+it.unitn.ds           Replica, Client, Main, UpdateID, Update, UpdateHistory
+it.unitn.ds.messages  all protocol messages, one class each
+it.unitn.ds.election  RingTopology, ElectionLogic, SyncPlan (pure logic)
+\end{verbatim}
+
+The \texttt{election} package deserves a note. It contains no actor code and no mutable state: every method is a pure function of its arguments (the ring order, the winner of an election payload, the list of updates to replay). This keeps the decision rules of the election separate from the message plumbing and makes the unit-testable without starting an actor system.
+
+\subsection*{Data classes}
+\texttt{UpdateID} is the immutable pair $\langle epoch, sequence \rangle$ that identifies an update. It implements \texttt{compareTo} as the lexicographic order, on $(epoch, sequence)$, so ``more recent'' is simply ``greater'', and it implements \texttt{equals}/\texttt{hashCode} so it can be used as a map key. \texttt{Update} bundles an \texttt{UpdateID} with the pair $(index, value)$ to write.
+
+\texttt{UpdateHistory} is the append-only log of the updates a replica has delivered. It exposes \texttt{latestId()}, used to publish how up to date a replica is during an election, and \texttt{after(threshold)}, which returns the entries strictly newer than a given id and is exactly the diff a lagging replica needs after an election. Entries can only be appended, nwver removed or reordered.
+
+\subsection*{Messages}
+
+Every message is a separate class, is \texttt{Serializable}, and has only \texttt{final} fields; the collections carried by \texttt{Election} and \texttt{Synchronization} are wrapped in unmodifiable views before being sent. No mutable state is ever shared between actors.
+
+\begin{center}
+  \begin{tabular}{l l l}
+    \textbf{Phase} & \textbf{Message} & \textbf{Direction} \\
+    \hline
+    Client         & \texttt{ClientRead}, \texttt{ClientWrite}  & client $\to$ replica \\
+                   & \texttt{ReadReply}, \texttt{WriteReply}    & replica $\to$ client \\
+    Update         & \texttt{ForwardWrite}                      & replica $\to$ coordinator \\
+                   & \texttt{UpdateMsg}                         & coordinator $\to$ all \\
+                   & \texttt{UpdateAck}                         & replica $\to$ coordinator \\
+                   & \texttt{WriteOk}                           & coordinator $\to$ all \\
+    Failure det.   & \texttt{Heartbeat}                         & coordinator $\to$ all \\
+                   & \texttt{HeartbeatTimeout}, \texttt{UpdateTimeout}        & self \\
+                   & \texttt{ForwardTimeout}                    & \\
+    Election       & \texttt{Election}, \texttt{ElectionAck}    & replica $\to$ replica \\
+                   & \texttt{Synchronization}                   & new coordinator $\to$ all \\
+                   & \texttt{ElectionAckTimeout}, \texttt{GlobalElectionTimeout} & self \\
+  \end{tabular}
+\end{center}
+
+All timeouts are self-messages scheduled with the Akka scheduler, so they enter the mailbox like any other messages and are processed by the behaviour that is active when they fire.
