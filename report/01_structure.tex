@@ -1,10 +1,10 @@
 \section{Project Structure}
 
-The system is a replicated array of integers kept consistent by a two-phase total order broadcast, coordinated by one distinguished replica. When the coordinator crashes, the surviving replicas eòect a new one with a ring-based algorithm and resume service in a new epoch.
+The system is a replicated array of integers kept consistent by a two-phase total order broadcast, coordinated by one distinguished replica. When the coordinator crashes, the surviving replicas elect a new one with a ring-based algorithm and resume service in a new epoch.
 
 \subsection*{Actors}
 
-There are three kinds of actor. \texttt{Replica} holds a local copy of the array and implements the whole protocol: it serves reads, forwards writes to the coordinator, participates in the two-phase broadcast, detects crashes and takes part in the elections. \texttt{Client} sends read and write requests to a replica and arms a timeout on each of them. \texttt{NetworkChannel} is the FIFO channel actor supplied with the codebase: one instance per (sender, destination) pair, it delays every message by a random amount between $5$ and $20$~ms while preserving order, which emulates network propagation delay. All replica-to-replica and replica-to-client traffic goes through \texttt{AbstractReplica.tell(msg, dst)}, which routes the message through the proper channel.
+There are three kinds of actor. \texttt{Replica} holds a local copy of the array and implements the whole protocol: it serves reads, forwards writes to the coordinator, participates in the two-phase broadcast, detects crashes and takes part in the elections. \texttt{Client} sends read and write requests to a replica and sets a timeout on each of them. \texttt{NetworkChannel} is the FIFO channel actor supplied with the codebase: one instance per (sender, destination) pair, it delays every message by a random amount between $5$ and $20$~ms while preserving order, which emulates network propagation delay. All replica-to-replica and replica-to-client traffic goes through \texttt{AbstractReplica.tell(msg, dst)}, which routes the message through the proper channel.
 
 \texttt{AbstractReplica} and \texttt{AbstractClient} come from the mandatory codebase and were not modified. They provide the crash command, the initialization message, the logging helpers and the callbacks thath the automated tests observe.
 
